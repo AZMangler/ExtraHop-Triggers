@@ -1,0 +1,525 @@
+/*
+Name:
+Custom Detection: TanStack / Mini Shai-Hulud outbound IOC activity
+
+Configuration Requirements:
+- ExtraHop Reveal(x) 360 / 9.x+
+- Events: DNS_REQUEST, DNS_RESPONSE, SSL_OPEN, HTTP_REQUEST
+
+Notes:
+- Outbound-only: internal client to external server
+- Excludes Palo Alto DNS sinkhole traffic (sinkhole.paloaltonetworks.com and 198.135.184.22)
+*/
+
+var IOCS = cache('tanstack_mini_shai_hulud_iocs_v5', function () {
+  return {
+    exactDomains: {
+      'filev2.getsession.org': 'Known Session-based exfiltration endpoint',
+      'seed1.getsession.org': 'Known Session seed endpoint',
+      'seed2.getsession.org': 'Known Session seed endpoint',
+      'seed3.getsession.org': 'Known Session seed endpoint',
+      'api.masscan.cloud': 'Known secret upload endpoint',
+      'git-tanstack.com': 'Known remote payload host',
+      'litter.catbox.moe': 'Known remote payload host'
+    },
+    suffixDomains: {
+      'getsession.org': 'Known Session infrastructure'
+    },
+    exactIps: {
+      '83.142.209.194': 'Known remote payload host'
+    },
+    uriFragments: {
+      '/router_init.js': 'Malicious JavaScript payload',
+      '/tanstack_runner.js': 'Malicious JavaScript payload',
+      '/transformers.pyz': 'Remote Python payload',
+      '/h8nc9u.js': 'Known catbox payload',
+      '/7rrc6l.mjs': 'Known catbox payload'
+    }
+  };
+});
+
+function asString(v) {
+  if (v === null || v === undefined) return '';
+  try { return String(v); } catch (e) { return ''; }
+}
+
+function safeLine(v) {
+  // Prevent newline injection into the Markdown enrichment
+  return asString(v).replace(/[\r\n]+/g, ' ');
+}
+
+function normalize(v) {
+  return asString(v).replace(/^\s+|\s+$/g, '').toLowerCase();
+}
+
+function normalizeHost(v) {
+  var host = normalize(v);
+  if (!host) return '';
+
+  if (host.charAt(host.length - 1) === '.') {
+    host = host.substring(0, host.length - 1);
+  }
+
+  if (host.indexOf(']:') !== -1) {
+    host = host.replace(/^[/, '').replace(/](:\d+)?$/, '');
+    return host;
+  }
+
+  if ((host.match(/:/g) || []).length === 1) {
+    host = host.split(':')[0];
+  }
+
+  return host;
+}
+
+function normalizeUri(v) {
+  return normalize(v);
+}
+
+function safeDeviceName(device) {
+  if (!device) return '';
+  if (device.dnsNames && device.dnsNames.length) return safeLine(device.dnsNames[0]);
+  if (device.netbiosName) return safeLine(device.netbiosName);
+  if (device.dhcpName) return safeLine(device.dhcpName);
+  if (device.cdpName) return safeLine(device.cdpName);
+  return '';
+}
+
+function safeHostnames(list) {
+  var out = [];
+  var i;
+  if (!list || !list.length) return '';
+  for (i = 0; i < list.length; i++) {
+    if (list[i] !== null && list[i] !== undefined) out.push(safeLine(list[i]));
+  }
+  return out.join(',');
+}
+
+function isClientExternal() {
+  return !!(Flow.client && Flow.client.ipaddr && Flow.client.ipaddr.isExternal);
+}
+
+function isServerExternal() {
+  return !!(Flow.server && Flow.server.ipaddr && Flow.server.ipaddr.isExternal);
+}
+
+function matchHost(host) {
+  var h = normalizeHost(host);
+  var suffix;
+
+  if (!h) return null;
+
+  if (IOCS.exactDomains[h]) {
+    return {
+      type: 'domain',
+      value: h,
+      reason: IOCS.exactDomains[h],
+      baseRisk: 90
+    };
+  }
+
+  for (suffix in IOCS.suffixDomains) {
+    if (h === suffix || h.indexOf('.' + suffix, h.length - (suffix.length + 1)) !== -1) {
+      return {
+        type: 'domain',
+        value: h,
+        reason: IOCS.suffixDomains[suffix],
+        baseRisk: 80
+      };
+    }
+  }
+
+  return null;
+}
+
+function matchIp(ipObj) {
+  var ip = asString(ipObj);
+  if (!ip) return null;
+
+  if (IOCS.exactIps[ip]) {
+    return {
+      type: 'ip',
+      value: ip,
+      reason: IOCS.exactIps[ip],
+      baseRisk: 80
+    };
+  }
+
+  return null;
+}
+
+function matchUri(uri) {
+  var u = normalizeUri(uri);
+  var fragment;
+
+  if (!u) return null;
+
+  for (fragment in IOCS.uriFragments) {
+    if (u.indexOf(fragment) !== -1) {
+      return {
+        type: 'uri',
+        value: fragment,
+        reason: IOCS.uriFragments[fragment],
+        baseRisk: 85
+      };
+    }
+  }
+
+  return null;
+}
+
+function combineIndicator(hostMatch, ipMatch, uriMatch) {
+  if (hostMatch && ipMatch && uriMatch) {
+    return {
+      type: 'domain+ip+uri',
+      value: hostMatch.value + ' | ' + ipMatch.value + ' | ' + uriMatch.value,
+      reason: hostMatch.reason + '; ' + ipMatch.reason + '; ' + uriMatch.reason,
+      baseRisk: Math.max(hostMatch.baseRisk, ipMatch.baseRisk, uriMatch.baseRisk)
+    };
+  }
+  if (hostMatch && uriMatch) {
+    return {
+      type: 'domain+uri',
+      value: hostMatch.value + ' | ' + uriMatch.value,
+      reason: hostMatch.reason + '; ' + uriMatch.reason,
+      baseRisk: Math.max(hostMatch.baseRisk, uriMatch.baseRisk)
+    };
+  }
+  if (hostMatch && ipMatch) {
+    return {
+      type: 'domain+ip',
+      value: hostMatch.value + ' | ' + ipMatch.value,
+      reason: hostMatch.reason + '; ' + ipMatch.reason,
+      baseRisk: Math.max(hostMatch.baseRisk, ipMatch.baseRisk)
+    };
+  }
+  if (ipMatch && uriMatch) {
+    return {
+      type: 'ip+uri',
+      value: ipMatch.value + ' | ' + uriMatch.value,
+      reason: ipMatch.reason + '; ' + uriMatch.reason,
+      baseRisk: Math.max(ipMatch.baseRisk, uriMatch.baseRisk)
+    };
+  }
+  if (hostMatch) return hostMatch;
+  if (ipMatch) return ipMatch;
+  if (uriMatch) return uriMatch;
+  return null;
+}
+
+function calculateRisk(indicator) {
+  var score = indicator && indicator.baseRisk ? indicator.baseRisk : 70;
+
+  if (event === 'SSL_OPEN') score += 5;
+  if (event === 'DNS_RESPONSE') score += 3;
+  if (
+    event === 'HTTP_REQUEST' &&
+    indicator &&
+    (indicator.type === 'domain+uri' || indicator.type === 'domain+ip+uri' || indicator.type === 'ip+uri')
+  ) {
+    score += 5;
+  }
+
+  if (score > 99) score = 99;
+  return score;
+}
+
+function summarizeDnsAnswers() {
+  var out = [];
+  var i;
+  var answer;
+
+  if (!DNS.answers || !DNS.answers.length) return '';
+
+  for (i = 0; i < DNS.answers.length; i++) {
+    answer = DNS.answers[i];
+    out.push(safeLine(answer.name) + '->' + safeLine(answer.data));
+  }
+
+  return out.join(' | ');
+}
+
+function detectionDescription(indicator, contextLine, extraLines) {
+  // Summary
+  var lines = [
+    'Observed network activity associated with Mini Shai-Hulud campaign indicators.',
+    '',
+    '## Indicator',
+    '- Type: ' + safeLine(indicator.type),
+    '- Value: ' + safeLine(indicator.value),
+    '- Reason: ' + safeLine(indicator.reason),
+    '',
+    '## Flow',
+    '- Event: ' + safeLine(event),
+    '- Protocol: ' + safeLine(Flow.l7proto),
+    '- Client IP: ' + safeLine(Flow.client && Flow.client.ipaddr ? Flow.client.ipaddr : ''),
+    '- Client Port: ' + safeLine(Flow.client && Flow.client.port),
+    '- Server IP: ' + safeLine(Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr : ''),
+    '- Server Port: ' + safeLine(Flow.server && Flow.server.port),
+    '- VLAN: ' + safeLine(Flow.vlan),
+    '- Client Locality: ' + safeLine(Flow.client && Flow.client.ipaddr ? Flow.client.ipaddr.localityName : ''),
+    '- Server Locality: ' + safeLine(Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr.localityName : ''),
+    '',
+    '## Device Context',
+    '- Client Device ID: ' + safeLine(Flow.client && Flow.client.device ? Flow.client.device.id : ''),
+    '- Client Device Name: ' + safeDeviceName(Flow.client ? Flow.client.device : null),
+    '- Client DNS Names: ' + safeHostnames(Flow.client && Flow.client.device ? Flow.client.device.dnsNames : null),
+    '- Server Device ID: ' + safeLine(Flow.server && Flow.server.device ? Flow.server.device.id : ''),
+    '- Server Device Name: ' + safeDeviceName(Flow.server ? Flow.server.device : null),
+    '- Server DNS Names: ' + safeHostnames(Flow.server && Flow.server.device ? Flow.server.device.dnsNames : null),
+    ''
+  ];
+
+  // Protocol Context
+  lines.push('## Protocol Context');
+
+  var tlsSni = '';
+  var tlsVersion = '';
+  var ja3 = '';
+  var ja3s = '';
+  var httpHost = '';
+  var httpMethod = '';
+  var httpUri = '';
+  var httpStatus = '';
+  var dnsQname = '';
+  var dnsQtype = '';
+  var dnsRdata = '';
+
+  if (event === 'SSL_OPEN') {
+    if (typeof SSL !== 'undefined' && SSL) {
+      tlsSni = safeLine(SSL.host);
+      tlsVersion = safeLine(SSL.version);
+      // ja3 / ja3s not available in current SSL typings; leave blank
+    }
+  } else if (event === 'HTTP_REQUEST') {
+    if (typeof HTTP !== 'undefined' && HTTP) {
+      httpHost = safeLine(HTTP.host);
+      httpMethod = safeLine(HTTP.method);
+      httpUri = safeLine(HTTP.uri || HTTP.path);
+      // statusCode is not present on HTTP for this event; leave blank
+    }
+  } else if (event === 'DNS_REQUEST' || event === 'DNS_RESPONSE') {
+    if (typeof DNS !== 'undefined' && DNS) {
+      dnsQname = safeLine(DNS.qname);
+      dnsQtype = safeLine(DNS.qtype);
+      if (event === 'DNS_RESPONSE') {
+        dnsRdata = safeLine(summarizeDnsAnswers());
+      }
+    }
+  }
+
+  // Keep ordering; values may be empty
+  lines.push('- TLS SNI: ' + tlsSni);
+  lines.push('- TLS Version: ' + tlsVersion);
+  lines.push('- JA3: ' + ja3);
+  lines.push('- JA3s: ' + ja3s);
+  lines.push('- HTTP Host: ' + httpHost);
+  lines.push('- HTTP Method: ' + httpMethod);
+  lines.push('- HTTP URI: ' + httpUri);
+  lines.push('- HTTP Status: ' + httpStatus);
+  lines.push('- DNS QNAME: ' + dnsQname);
+  lines.push('- DNS QTYPE: ' + dnsQtype);
+  lines.push('- DNS RDATA: ' + dnsRdata);
+
+  if (contextLine) {
+    lines.push('- Context: ' + safeLine(contextLine));
+  }
+
+  if (extraLines && extraLines.length) {
+    for (var i = 0; i < extraLines.length; i++) {
+      lines.push('- ' + safeLine(extraLines[i]));
+    }
+  }
+
+  lines.push('');
+  lines.push('## IOC Context');
+
+  var indicatorCategory = 'TanStack / Mini Shai-Hulud IOC';
+  var matchSource = safeLine(event);
+  var ruleId = 'tanstack_mini_shai_hulud_ioc';
+  var pattern = safeLine(indicator && indicator.value ? indicator.value : '');
+
+  lines.push('- Indicator Category: ' + indicatorCategory);
+  lines.push('- Match Source: ' + matchSource);
+  lines.push('- Rule ID: ' + ruleId);
+  lines.push('- Pattern: ' + pattern);
+
+  return lines.join('\n');
+}
+
+function commitMiniDetection(indicator, contextLine, extraLines) {
+  commitDetection('tanstack_mini_shai_hulud_ioc', {
+    title: 'TanStack / Mini Shai-Hulud outbound IOC activity',
+    description: detectionDescription(indicator, contextLine, extraLines),
+    categories: ['sec.command', 'sec.exfil'],
+    riskScore: calculateRisk(indicator),
+    participants: [Flow.client.offender, Flow.server.victim],
+    identityKey: [
+      event,
+      indicator.type,
+      indicator.value,
+      asString(Flow.client && Flow.client.ipaddr ? Flow.client.ipaddr : ''),
+      asString(Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr : '')
+    ].join('!!'),
+    identityTtl: 'day'
+  });
+}
+
+/* DNS_REQUEST */
+if (event === 'DNS_REQUEST') {
+  var dnsRequestHostMatch = null;
+
+  if (isClientExternal()) return;
+
+  // Exclude Palo Alto sinkhole domain
+  if (DNS && DNS.qname && normalizeHost(DNS.qname) === 'sinkhole.paloaltonetworks.com') return;
+
+  dnsRequestHostMatch = matchHost(DNS.qname);
+  if (!dnsRequestHostMatch) return;
+
+  commitMiniDetection(
+    dnsRequestHostMatch,
+    'DNS qname: ' + asString(DNS.qname),
+    [
+      'QName: ' + asString(DNS.qname),
+      'QType: ' + asString(DNS.qtype),
+      'Opcode: ' + asString(DNS.opcode)
+    ]
+  );
+  return;
+}
+
+/* DNS_RESPONSE */
+if (event === 'DNS_RESPONSE') {
+  var dnsResponseHostMatch = null;
+  var dnsResponseIpMatch = null;
+  var dnsResponseIndicator = null;
+  var answer = null;
+  var i = 0;
+
+  if (isClientExternal()) return;
+
+  // Exclude Palo Alto sinkhole IP in answers
+  if (DNS && DNS.answers && DNS.answers.length) {
+    for (i = 0; i < DNS.answers.length; i++) {
+      answer = DNS.answers[i];
+      if (asString(answer && answer.data) === '198.135.184.22') return;
+    }
+  }
+
+  dnsResponseHostMatch = matchHost(DNS.qname);
+  if (dnsResponseHostMatch) {
+    commitMiniDetection(
+      dnsResponseHostMatch,
+      'DNS qname: ' + asString(DNS.qname),
+      [
+        'QName: ' + asString(DNS.qname),
+        'QType: ' + asString(DNS.qtype),
+        'Opcode: ' + asString(DNS.opcode),
+        'Answers: ' + summarizeDnsAnswers()
+      ]
+    );
+    return;
+  }
+
+  if (DNS.answers && DNS.answers.length) {
+    for (i = 0; i < DNS.answers.length; i++) {
+      answer = DNS.answers[i];
+      dnsResponseHostMatch = null;
+      dnsResponseIpMatch = null;
+
+      if (answer && answer.name) {
+        dnsResponseHostMatch = matchHost(answer.name);
+      }
+
+      if (answer && typeof answer.data === 'string') {
+        if (!dnsResponseHostMatch) dnsResponseHostMatch = matchHost(answer.data);
+        dnsResponseIpMatch = matchIp(answer.data);
+      }
+
+      dnsResponseIndicator = combineIndicator(dnsResponseHostMatch, dnsResponseIpMatch, null);
+
+      if (dnsResponseIndicator) {
+        commitMiniDetection(
+          dnsResponseIndicator,
+          'DNS qname: ' + asString(DNS.qname),
+          [
+            'QName: ' + asString(DNS.qname),
+            'QType: ' + asString(DNS.qtype),
+            'Opcode: ' + asString(DNS.opcode),
+            'Answer Name: ' + asString(answer.name),
+            'Answer Data: ' + asString(answer.data)
+          ]
+        );
+        return;
+      }
+    }
+  }
+
+  return;
+}
+
+/* outbound-only guard for TLS / HTTP */
+if (!isServerExternal()) return;
+if (isClientExternal()) return;
+
+var flowIpMatch = matchIp(Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr : null);
+
+/* SSL_OPEN */
+if (event === 'SSL_OPEN') {
+  var sslHostMatch = null;
+  var sslIndicator = null;
+
+  if (!SSL || SSL.host === null || SSL.host === undefined) {
+    if (!flowIpMatch) return;
+
+    commitMiniDetection(
+      flowIpMatch,
+      'TLS SNI: ',
+      []
+    );
+    return;
+  }
+
+  sslHostMatch = matchHost(SSL.host);
+  sslIndicator = combineIndicator(sslHostMatch, flowIpMatch, null);
+
+  if (!sslIndicator) return;
+
+  commitMiniDetection(
+    sslIndicator,
+    'TLS SNI: ' + asString(SSL.host),
+    [
+      'Host: ' + asString(SSL.host)
+    ]
+  );
+  return;
+}
+
+/* HTTP_REQUEST */
+if (event === 'HTTP_REQUEST') {
+  var httpHost = asString(HTTP && HTTP.host ? HTTP.host : '');
+  var httpUri = asString(HTTP && (HTTP.uri || HTTP.path) ? (HTTP.uri || HTTP.path) : '');
+  var httpHostMatch = null;
+  var httpUriMatch = null;
+  var httpIndicator = null;
+
+  if (httpHost) httpHostMatch = matchHost(httpHost);
+  if (httpUri) httpUriMatch = matchUri(httpUri);
+
+  httpIndicator = combineIndicator(httpHostMatch, flowIpMatch, httpUriMatch);
+  if (!httpIndicator) return;
+
+  commitMiniDetection(
+    httpIndicator,
+    'HTTP host: ' + httpHost,
+    [
+      'Method: ' + asString(HTTP && HTTP.method),
+      'Host: ' + httpHost,
+      'URI: ' + httpUri,
+      'Query: ' + asString(HTTP && HTTP.query),
+      'User-Agent: ' + asString(HTTP && HTTP.userAgent)
+    ]
+  );
+  return;
+}
