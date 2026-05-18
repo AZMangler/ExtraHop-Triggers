@@ -1,0 +1,291 @@
+/*
+ * Name: Custom Detection: Over-Employment or Impossible Travel
+ *
+ * Configuration Requirements:
+ *   - Reveal(x) 360 / RX 9.x+ (validated against 26.1 Trigger API).
+ *   - Events to subscribe (Edit Trigger -> Events), EXACTLY two:
+ *       * KERBEROS_REQUEST
+ *       * KERBEROS_RESPONSE
+ *     YOU MUST CHECK THESE TWO BOXES BEFORE THE EDITOR WILL RECOGNIZE
+ *     THE KRB5 OBJECT. Subscribing to any other event will cause
+ *     per-event validator errors; this script references KRB5.* only.
+ *   - Assignment: All Activity, or a Device Group scoped to AD / KDC
+ *     servers (recommended for performance).
+ *   - Advanced options: defaults. No payload buffering required.
+ *   - Privileges: trigger write privilege to save/enable.
+ *   - Known exclusions:
+ *       * Internal RFC1918 / loopback / broadcast client IPs are skipped
+ *         (no meaningful geolocation).
+ *       * KDC error 25 (KDC_ERR_PREAUTH_REQUIRED) is skipped (benign
+ *         first AS-REQ message).
+ *       * Machine principals (cname ending in '$') are skipped.
+ *       * Anonymous or empty principals are skipped.
+ *       * Palo Alto DNS sinkhole exclusion: N/A (no DNS events).
+ *
+ * Notes:
+ *   - Identity is the lowercased "cname@realm" from KRB5.
+ *   - Locality is IPAddress.localityName. Trigger context has no lat/lon,
+ *     so distinct external localities within a time window are the signal.
+ *   - State: Session key "ut:<user>" with TTL = OVEREMPLOYMENT_WINDOW_SEC.
+ *   - Dedup: commitDetection identityKey = "<user>|<sortedLocalityPair>"
+ *     with identityTtl = "hour". Same pair will not re-fire within 1 hour.
+ *   - Detection types emitted:
+ *       * suspected_over_employment  (two distinct localities within the
+ *         concurrency window -> treated as overlapping sessions)
+ *       * impossible_travel          (two distinct localities within the
+ *         travel window but outside the concurrency window)
+ */
+
+// ---------------- Tunables ----------------
+var IMPOSSIBLE_TRAVEL_WINDOW_SEC = 60 * 60;
+var OVEREMPLOYMENT_WINDOW_SEC    = 60 * 60;
+var SESSION_PRIORITY             = Session.PRIORITY_HIGH;
+
+// Typed-any handle to KRB5. Resolved via the global "this" so the editor
+// will not flag "Cannot find name 'KRB5'" before the Kerberos events
+// are checked on the Events tab. Once events are checked, KRB5 is the
+// live trigger global.
+var KRB = /** @type {any} */ ((function () { return this; })().KRB5);
+
+// ---------------- Small helpers ----------------
+function asString(value) {
+    if (value === null || value === undefined) return '';
+    try { return String(value); } catch (e) { return ''; }
+}
+
+function safeDeviceName(device) {
+    if (!device) return '';
+    return asString(device.name || '');
+}
+
+function safeHostnames(arr) {
+    if (!arr || !arr.length) return '';
+    try { return arr.join(', '); } catch (e) { return ''; }
+}
+
+function isExternalIp(ip) {
+    if (!ip) return false;
+    if (ip.isBroadcast) return false;
+    if (ip.isLoopback) return false;
+    return ip.isExternal === true;
+}
+
+function localityOf(ip) {
+    if (!ip) return '';
+    var name = ip.localityName;
+    if (!name || name === 'Unknown') return '';
+    return asString(name);
+}
+
+// ---------------- Identity extraction ----------------
+function extractKerberosIdentity() {
+    if (!KRB) return null;
+
+    // Skip benign KDC_ERR_PREAUTH_REQUIRED.
+    if (KRB.errorCode && KRB.errorCode === 25) return null;
+
+    var cname = KRB.cname;
+    if (!cname) return null;
+
+    var cnameStr = asString(cname);
+    if (cnameStr.length === 0) return null;
+
+    // Skip machine principals (computer$).
+    if (cnameStr.indexOf('$') !== -1) return null;
+
+    var realmStr = asString(KRB.realm);
+    var user = realmStr ? (cnameStr + '@' + realmStr) : cnameStr;
+
+    return { user: user.toLowerCase(), source: 'kerberos' };
+}
+
+// ---------------- SOC Analysis Enrichment ----------------
+function detectionDescription(indicator, contextLine) {
+    var clientDev = Flow && Flow.client ? Flow.client.device : null;
+    var serverDev = Flow && Flow.server ? Flow.server.device : null;
+    var clientIp  = Flow && Flow.client ? Flow.client.ipaddr : null;
+    var serverIp  = Flow && Flow.server ? Flow.server.ipaddr : null;
+
+    var lines = [
+        'Observed authentication activity associated with ' +
+            asString(indicator.campaign || indicator.name || 'over-employment / impossible travel') +
+            ' indicators.',
+        '',
+        '## Indicator',
+        '- Type: ' + asString(indicator.type),
+        '- Value: ' + asString(indicator.value),
+        '- Reason: ' + asString(indicator.reason),
+        '',
+        '## Flow',
+        '- Event: ' + asString(indicator.event),
+        '- Protocol: ' + asString(Flow && Flow.l7proto),
+        '- Client IP: ' + asString(clientIp),
+        '- Client Port: ' + asString(Flow && Flow.client ? Flow.client.port : ''),
+        '- Server IP: ' + asString(serverIp),
+        '- Server Port: ' + asString(Flow && Flow.server ? Flow.server.port : ''),
+        '- VLAN: ' + asString(Flow && Flow.vlan),
+        '- Client Locality: ' + asString(clientIp ? clientIp.localityName : ''),
+        '- Server Locality: ' + asString(serverIp ? serverIp.localityName : ''),
+        '',
+        '## Device Context',
+        '- Client Device ID: ' + asString(clientDev ? clientDev.id : ''),
+        '- Client Device Name: ' + safeDeviceName(clientDev),
+        '- Client DNS Names: ' + safeHostnames(clientDev ? clientDev.dnsNames : null),
+        '- Server Device ID: ' + asString(serverDev ? serverDev.id : ''),
+        '- Server Device Name: ' + safeDeviceName(serverDev),
+        '- Server DNS Names: ' + safeHostnames(serverDev ? serverDev.dnsNames : null)
+    ];
+
+    var protoCtx = [];
+    if (KRB) {
+        if (KRB.cname)     protoCtx.push('- Kerberos cname: '     + asString(KRB.cname));
+        if (KRB.realm)     protoCtx.push('- Kerberos realm: '     + asString(KRB.realm));
+        if (KRB.sname)     protoCtx.push('- Kerberos sname: '     + asString(KRB.sname));
+        if (KRB.errorCode) protoCtx.push('- Kerberos errorCode: ' + asString(KRB.errorCode));
+    }
+    if (protoCtx.length) {
+        lines.push('');
+        lines.push('## Protocol Context');
+        Array.prototype.push.apply(lines, protoCtx);
+    }
+
+    var iocCtx = [];
+    if (indicator.category)        iocCtx.push('- Indicator Category: '  + asString(indicator.category));
+    if (indicator.source)          iocCtx.push('- Match Source: '        + asString(indicator.source));
+    if (indicator.ruleId)          iocCtx.push('- Rule ID: '             + asString(indicator.ruleId));
+    if (indicator.pattern)         iocCtx.push('- Pattern: '             + asString(indicator.pattern));
+    if (indicator.priorLocality)   iocCtx.push('- Prior Locality: '      + asString(indicator.priorLocality));
+    if (indicator.currentLocality) iocCtx.push('- Current Locality: '    + asString(indicator.currentLocality));
+    if (indicator.priorClientIp)   iocCtx.push('- Prior Client IP: '     + asString(indicator.priorClientIp));
+    if (indicator.currentClientIp) iocCtx.push('- Current Client IP: '   + asString(indicator.currentClientIp));
+    if (indicator.priorSource)     iocCtx.push('- Prior Source: '        + asString(indicator.priorSource));
+    if (indicator.deltaSeconds !== undefined) {
+        iocCtx.push('- Delta Seconds: ' + asString(indicator.deltaSeconds));
+    }
+    if (iocCtx.length) {
+        lines.push('');
+        lines.push('## IOC Context');
+        Array.prototype.push.apply(lines, iocCtx);
+    }
+
+    lines.push('');
+    lines.push('## Observation');
+    lines.push('- Observed At: ' + asString(new Date().toISOString()));
+    if (contextLine) lines.push('- Context: ' + asString(contextLine));
+
+    return lines.join('\n');
+}
+
+// ---------------- Main ----------------
+(function main() {
+    var ident = extractKerberosIdentity();
+    if (!ident) return;
+
+    var clientIp = Flow && Flow.client ? Flow.client.ipaddr : null;
+    if (!isExternalIp(clientIp)) return;
+
+    var currentLocality = localityOf(clientIp);
+    if (!currentLocality) return;
+
+    var nowSec = Math.floor(Date.now() / 1000);
+    var user   = ident.user;
+    var key    = 'ut:' + user;
+    var prior  = Session.lookup(key);
+
+    var thisObs = {
+        loc: currentLocality,
+        ip:  asString(clientIp),
+        ts:  nowSec,
+        src: ident.source
+    };
+
+    if (!prior || !prior.loc || prior.loc === currentLocality) {
+        Session.add(key, thisObs, {
+            expire:   OVEREMPLOYMENT_WINDOW_SEC,
+            priority: SESSION_PRIORITY
+        });
+        return;
+    }
+
+    var delta      = nowSec - (prior.ts || nowSec);
+    var concurrent = (delta >= 0 && delta <= OVEREMPLOYMENT_WINDOW_SEC);
+    var impossible = (delta >= 0 && delta <= IMPOSSIBLE_TRAVEL_WINDOW_SEC);
+
+    if (!concurrent && !impossible) {
+        Session.add(key, thisObs, {
+            expire:   OVEREMPLOYMENT_WINDOW_SEC,
+            priority: SESSION_PRIORITY
+        });
+        return;
+    }
+
+    var detectionType;
+    var title;
+    var reason;
+    var category;
+    var oeMinutes = Math.floor(OVEREMPLOYMENT_WINDOW_SEC / 60);
+    var itMinutes = Math.floor(IMPOSSIBLE_TRAVEL_WINDOW_SEC / 60);
+
+    if (concurrent) {
+        detectionType = 'suspected_over_employment';
+        title         = 'Suspected Over-Employment: ' + user;
+        reason        = 'User authenticated concurrently from two distinct external localities within ' +
+                        oeMinutes + ' minutes.';
+        category      = 'identity.concurrent_sessions';
+    } else {
+        detectionType = 'impossible_travel';
+        title         = 'Impossible Travel: ' + user;
+        reason        = 'User authenticated from two distinct external localities within ' +
+                        itMinutes + ' minutes.';
+        category      = 'identity.impossible_travel';
+    }
+
+    var indicator = {
+        name:            'Over-Employment / Impossible Travel',
+        campaign:        'Identity Behavioral Anomaly',
+        type:            'user-locality-pair',
+        value:           user + ' [' + prior.loc + ' -> ' + currentLocality + ']',
+        reason:          reason,
+        category:        category,
+        source:          ident.source,
+        priorSource:     prior.src,
+        ruleId:          'OE-IT-001',
+        pattern:         'distinct_external_locality_within_window',
+        event:           'KERBEROS',
+        priorLocality:   prior.loc,
+        currentLocality: currentLocality,
+        priorClientIp:   prior.ip,
+        currentClientIp: asString(clientIp),
+        deltaSeconds:    delta
+    };
+
+    var description = detectionDescription(
+        indicator,
+        'Prior auth via ' + asString(prior.src) + ' from ' + asString(prior.ip) +
+        ' (' + asString(prior.loc) + ') ' + asString(delta) + 's ago.'
+    );
+
+    var participants = [];
+    if (Flow && Flow.client && Flow.client.offender) participants.push(Flow.client.offender);
+    if (Flow && Flow.server && Flow.server.victim)   participants.push(Flow.server.victim);
+
+    var pair        = [prior.loc, currentLocality].sort().join('|');
+    var identityKey = user + '|' + pair;
+
+    try {
+        commitDetection(detectionType, {
+            title:        title,
+            description:  description,
+            participants: participants,
+            identityKey:  identityKey,
+            identityTtl:  'hour'
+        });
+    } catch (e) {
+        debug('commitDetection failed: ' + asString(e));
+    }
+
+    Session.add(key, thisObs, {
+        expire:   OVEREMPLOYMENT_WINDOW_SEC,
+        priority: SESSION_PRIORITY
+    });
+})();

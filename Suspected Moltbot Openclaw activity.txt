@@ -1,0 +1,248 @@
+/*
+ * Name: Custom Detection: Suspected Moltbot Activity (Playwright on MOLT ports)
+ *
+ * Configuration Requirements
+ * --------------------------
+ * Platform:        Reveal(x) 360 / 9.x+ (validated against 26.1 Trigger API)
+ * Assign to:       All Activity (or scoped to web-facing client device groups)
+ * Events:          HTTP_REQUEST, HTTP_RESPONSE (response only used if you later
+ *                  extend enrichment), REMOTE_RESPONSE
+ * Advanced opts:   None required. Do NOT enable payload buffering.
+ * Privileges:      Trigger author needs "System and Access Administration" or
+ *                  equivalent rights to create/save/enable triggers and to
+ *                  call /api/v1/devicegroups via Remote.HTTP('self').
+ * ODS target:      'self' (built-in loopback HTTP target for the local sensor /
+ *                  console REST API). No external ODS target required.
+ * Device Group:    ID 355 must exist; trigger will assign matching clients.
+ *
+ * Detection
+ * ---------
+ * Logic:           External HTTP request on TCP/18789 or TCP/18791 with a
+ *                  Playwright User-Agent string from any internal client.
+ * Detection type:  suspected_moltbot_activity (custom)
+ * Dedup:           identityKey = client discovery ID, identityTtl = 'day'
+ *                  (sensor will consolidate; max 250 distinct detections
+ *                  per trigger per day per ExtraHop limits).
+ *
+ * Known Exclusions
+ * ----------------
+ * - Not applicable here (no DNS path). If this trigger is later extended to
+ *   DNS_REQUEST/DNS_RESPONSE, exclude Palo Alto sinkhole traffic by skipping
+ *   DNS_RESPONSE answers containing 198.135.184.22 and DNS_REQUEST qname
+ *   equal to sinkhole.paloaltonetworks.com.
+ *
+ * Notes
+ * -----
+ * - Indicator list (MOLT_PORTS, USER_AGENT_TOKEN) is static in-trigger; update
+ *   by editing the constants below.
+ * - Matching is anchored: exact port membership, substring match on Playwright
+ *   only after HTTP.userAgent is verified present, and external-IP guard via
+ *   Flow.server.ipaddr.isExternal.
+ * - Auto-assignment to device group ID 355 is best-effort; failures are logged
+ *   but do not affect detection commit.
+ * - All optional objects (Flow.client.device, Flow.server.device, HTTP.headers)
+ *   are null-checked to avoid runtime errors per RX trigger guardrails.
+ */
+
+// ---------- Constants ----------
+var DEV_GROUP_ID      = 355;
+var DETECTION_TYPE    = 'suspected_moltbot_activity';
+var USER_AGENT_TOKEN  = 'Playwright';
+var MOLT_PORTS = {
+    18789: true,
+    18791: true
+};
+
+// ---------- Helpers ----------
+function asString(x) {
+    if (x === null || x === undefined) return '';
+    try { return String(x); } catch (e) { return ''; }
+}
+
+function safeDeviceName(device) {
+    if (!device) return '';
+    return asString(device.name || device.dnsName || device.dhcpName || device.id);
+}
+
+function safeHostnames(arr) {
+    if (!arr) return '';
+    if (Object.prototype.toString.call(arr) !== '[object Array]') return asString(arr);
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+        var v = asString(arr[i]);
+        if (v) out.push(v);
+    }
+    return out.join(', ');
+}
+
+function parseJSON(jsonString) {
+    try { return JSON.parse(jsonString); }
+    catch (e) { return null; }
+}
+
+// ---------- Enrichment block ----------
+function detectionDescription(indicator, contextLine) {
+    var clientDev = (Flow && Flow.client) ? Flow.client.device : null;
+    var serverDev = (Flow && Flow.server) ? Flow.server.device : null;
+    var clientIp  = (Flow && Flow.client) ? Flow.client.ipaddr : null;
+    var serverIp  = (Flow && Flow.server) ? Flow.server.ipaddr : null;
+
+    var lines = [
+        'Observed network activity associated with ' +
+            asString(indicator.campaign || indicator.name || 'provided') + ' indicators.',
+        '',
+        '## Indicator',
+        '- Type: '   + asString(indicator.type),
+        '- Value: '  + asString(indicator.value),
+        '- Reason: ' + asString(indicator.reason),
+        '',
+        '## Flow',
+        '- Event: '            + asString(event),
+        '- Protocol: '         + asString(Flow && Flow.l7proto),
+        '- Client IP: '        + asString(clientIp),
+        '- Client Port: '      + asString(Flow && Flow.client && Flow.client.port),
+        '- Server IP: '        + asString(serverIp),
+        '- Server Port: '      + asString(Flow && Flow.server && Flow.server.port),
+        '- VLAN: '             + asString(Flow && Flow.vlan),
+        '- Client Locality: '  + asString(clientIp ? clientIp.localityName : ''),
+        '- Server Locality: '  + asString(serverIp ? serverIp.localityName : ''),
+        '',
+        '## Device Context',
+        '- Client Device ID: '   + asString(clientDev ? clientDev.id : ''),
+        '- Client Device Name: ' + safeDeviceName(clientDev),
+        '- Client DNS Names: '   + safeHostnames(clientDev ? clientDev.dnsNames : null),
+        '- Server Device ID: '   + asString(serverDev ? serverDev.id : ''),
+        '- Server Device Name: ' + safeDeviceName(serverDev),
+        '- Server DNS Names: '   + safeHostnames(serverDev ? serverDev.dnsNames : null)
+    ];
+
+    // ---- Protocol Context (HTTP only on this event) ----
+    var protoCtx = [];
+    if (typeof HTTP !== 'undefined') {
+        if (HTTP.host)       protoCtx.push('- HTTP Host: '   + asString(HTTP.host));
+        if (HTTP.method)     protoCtx.push('- HTTP Method: ' + asString(HTTP.method));
+        if (HTTP.uri)        protoCtx.push('- HTTP URI: '    + asString(HTTP.uri));
+        if (HTTP.statusCode) protoCtx.push('- HTTP Status: ' + asString(HTTP.statusCode));
+        if (HTTP.userAgent)  protoCtx.push('- HTTP User-Agent: ' + asString(HTTP.userAgent));
+        var ref = HTTP.headers && (HTTP.headers['Referer'] || HTTP.headers['referer']);
+        if (ref) protoCtx.push('- HTTP Referrer: ' + asString(ref));
+        var contentType = HTTP.headers &&
+            (HTTP.headers['Content-Type'] || HTTP.headers['content-type']);
+        if (contentType) protoCtx.push('- HTTP Content-Type: ' + asString(contentType));
+    }
+    if (protoCtx.length) {
+        lines.push('', '## Protocol Context');
+        Array.prototype.push.apply(lines, protoCtx);
+    }
+
+    // ---- IOC Context ----
+    var iocCtx = [];
+    if (indicator.category) iocCtx.push('- Indicator Category: ' + asString(indicator.category));
+    if (indicator.source)   iocCtx.push('- Match Source: '       + asString(indicator.source));
+    if (indicator.ruleId)   iocCtx.push('- Rule ID: '            + asString(indicator.ruleId));
+    if (indicator.pattern)  iocCtx.push('- Pattern: '            + asString(indicator.pattern));
+    if (iocCtx.length) {
+        lines.push('', '## IOC Context');
+        Array.prototype.push.apply(lines, iocCtx);
+    }
+
+    // ---- Observation ----
+    lines.push('', '## Observation');
+    lines.push('- Observed At: ' + asString(new Date().toISOString()));
+    if (contextLine) lines.push('- Context: ' + asString(contextLine));
+
+    return lines.join('\n');
+}
+
+// ---------- Main: HTTP_REQUEST ----------
+if (event === 'HTTP_REQUEST') {
+
+    // Protocol guard: must have HTTP context to evaluate
+    if (typeof HTTP === 'undefined') return;
+
+    // External server only (avoid scoring lateral internal traffic)
+    if (!Flow || !Flow.server || !Flow.server.ipaddr || !Flow.server.ipaddr.isExternal) return;
+
+    // Exact port membership (MOLT C2 listeners)
+    if (!MOLT_PORTS[Flow.server.port]) return;
+
+    // Anchor on Playwright User-Agent; require UA present before matching
+    if (!HTTP.userAgent) return;
+    if (asString(HTTP.userAgent).indexOf(USER_AGENT_TOKEN) === -1) return;
+
+    // Discovery ID of the offending client
+    var discoveryId = (Flow.client && Flow.client.device) ? Flow.client.device.id : null;
+    if (!discoveryId) return;
+
+    // Build indicator metadata for enrichment
+    var indicator = {
+        name:     'Suspected Moltbot Activity',
+        campaign: 'Moltbot',
+        type:     'http_user_agent + tcp_port',
+        value:    USER_AGENT_TOKEN + ' UA to ' +
+                  asString(Flow.server.ipaddr) + ':' + asString(Flow.server.port),
+        reason:   'Playwright-driven HTTP request to external host on known MOLT C2 port ' +
+                  asString(Flow.server.port),
+        category: 'C2 / Botnet',
+        source:   'Custom trigger (Moltbot)',
+        ruleId:   DETECTION_TYPE,
+        pattern:  'HTTP.userAgent contains "' + USER_AGENT_TOKEN +
+                  '" AND Flow.server.port in {18789,18791} AND Flow.server.ipaddr.isExternal'
+    };
+
+    var description = detectionDescription(
+        indicator,
+        'Auto-assigning client discovery ID ' + asString(discoveryId) +
+        ' to device group ' + DEV_GROUP_ID
+    );
+
+    // Commit detection (RX consolidates by identityKey for the TTL window)
+    commitDetection(DETECTION_TYPE, {
+        title: 'Suspected Moltbot activity detected',
+        description: description,
+        riskScore: 60,
+        participants: [
+            Flow.client.offender,
+            Flow.server.victim
+        ],
+        identityKey: asString(discoveryId),
+        identityTtl: 'day'
+    });
+
+    // Best-effort: look up the device record so we can assign it to a group
+    Remote.HTTP('self').get({
+        path: '/api/v1/devices?limit=1&search_type=discovery_id&value=' +
+              encodeURIComponent(asString(discoveryId)),
+        headers: { 'accept': 'application/json' },
+        enableResponseEvent: true,
+        context: { discoveryId: asString(discoveryId) }
+    });
+}
+
+// ---------- REST callback: REMOTE_RESPONSE ----------
+if (event === 'REMOTE_RESPONSE') {
+    var resp = Remote.response;
+    if (!resp || resp.statusCode !== 200 || !resp.body) return;
+
+    var data = parseJSON(asString(resp.body));
+    if (!data || !data.results || !data.results.length) return;
+
+    var devId = data.results[0].id;
+    if (!devId) return;
+
+    var payload = JSON.stringify({
+        assign:   [ devId ],
+        unassign: []
+    });
+
+    Remote.HTTP('self').post({
+        path: '/api/v1/devicegroups/' + DEV_GROUP_ID + '/devices',
+        headers: {
+            'accept': 'application/json',
+            'Content-Type': 'application/json'
+        },
+        payload: payload
+    });
+
+    log('Moltbot trigger: assigned device ' + devId + ' to device group ' + DEV_GROUP_ID);
+}
