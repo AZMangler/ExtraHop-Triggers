@@ -1,0 +1,380 @@
+/******************************
+ * Custom Detection: Country of Concern Access
+ *
+ * Configuration Requirements:
+ * - Platform: ExtraHop Reveal(x) 360 / 9.x+.
+ * - Events: HTTP_REQUEST, SSL_OPEN, AAA_REQUEST, AAA_RESPONSE, SSH_OPEN.
+ * - Assignment: Perimeter / internet-facing sensors or device groups where client IPs are external.
+ * - GeoIP: GeoIP.getCountry() must be enabled.
+ * - Logging: Remote.Syslog target named "Chronicle-SIEM" must exist.
+ * - Privileges: User account must be able to create triggers and custom detections.
+ *
+ * Known Exclusions:
+ * - Skips flows where Flow.client.ipaddr is RFC1918.
+ * - Skips traffic where HTTP.host or client device names match EXCLUDED_HOSTS.
+ *
+ * Notes:
+ * - Detection type ID: country_of_concern_access (appears as custom.country_of_concern_access).
+ * - Identity key: <identity>:<countryCode> with identityTtl 'day' to consolidate repeated activity.
+ ******************************/
+
+const COUNTRIES_OF_CONCERN = [
+  'RU', 'CN', 'IR', 'KP', 'CU', 'SY'
+];
+
+const SYSLOG_TARGET = 'SIEM_NAME';
+
+const HTTP_ID_HEADERS = [
+  'X-Authenticated-User',
+  'X-MS-CLIENT-PRINCIPAL-NAME',
+  'X-REMOTE-USER',
+  'X-Forwarded-User',
+  'X-User'
+];
+
+const EXCLUDED_HOSTS = [
+  'YourHost.tustin1.level3.net',
+  'YourHost.tustin1.level3.net'
+];
+
+/******************************
+ * HELPER FUNCTIONS
+ ******************************/
+
+function asString(x) {
+    if (x === null || x === undefined) return '';
+    var s = '' + x;
+    return s.replace(/[\r\n]+/g, ' ');
+}
+
+function safeDeviceName(device) {
+    if (!device) return '';
+    if (device.name) return asString(device.name);
+    if (device.dnsNames && device.dnsNames.length) return asString(device.dnsNames[0]);
+    if (device.netbiosName) return asString(device.netbiosName);
+    if (device.dhcpName) return asString(device.dhcpName);
+    if (device.cdpName) return asString(device.cdpName);
+    return '';
+}
+
+function safeHostnames(arr) {
+    if (!arr || !arr.length) return '';
+    var out = [];
+    for (var i = 0; i < arr.length; i++) {
+        if (arr[i]) out.push(asString(arr[i]));
+    }
+    return out.join(', ');
+}
+
+function detectionDescription(indicator, contextLine) {
+    var lines = [
+        'Observed network activity associated with ' + asString(indicator.campaign || indicator.name || 'provided') + ' indicators.',
+        '',
+        '## Indicator',
+        '- Type: ' + asString(indicator.type),
+        '- Value: ' + asString(indicator.value),
+        '- Reason: ' + asString(indicator.reason),
+        '',
+        '## Flow',
+        '- Event: ' + asString(event),
+        '- Protocol: ' + asString(Flow && Flow.l7proto),
+        '- Client IP: ' + asString(Flow && Flow.client && Flow.client.ipaddr),
+        '- Client Port: ' + asString(Flow && Flow.client && Flow.client.port),
+        '- Server IP: ' + asString(Flow && Flow.server && Flow.server.ipaddr),
+        '- Server Port: ' + asString(Flow && Flow.server && Flow.server.port),
+        '- VLAN: ' + asString(Flow && Flow.vlan),
+        '- Client Locality: ' + asString(Flow && Flow.client && Flow.client.ipaddr ? Flow.client.ipaddr.localityName : ''),
+        '- Server Locality: ' + asString(Flow && Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr.localityName : ''),
+        '',
+        '## Device Context',
+        '- Client Device ID: ' + asString(Flow && Flow.client && Flow.client.device ? Flow.client.device.id : ''),
+        '- Client Device Name: ' + safeDeviceName(Flow && Flow.client && Flow.client.device),
+        '- Client DNS Names: ' + safeHostnames(Flow && Flow.client && Flow.client.device ? Flow.client.device.dnsNames : null),
+        '- Server Device ID: ' + asString(Flow && Flow.server && Flow.server.device ? Flow.server.device.id : ''),
+        '- Server Device Name: ' + safeDeviceName(Flow && Flow.server && Flow.server.device),
+        '- Server DNS Names: ' + safeHostnames(Flow && Flow.server && Flow.server.device ? Flow.server.device.dnsNames : null)
+    ];
+
+    var protoCtx = [];
+
+    // SSL / TLS context (per Trigger API: host, ja3Hash, ja3sHash, version) :llmCitationRef[2] :llmCitationRef[3]
+    if (typeof SSL !== 'undefined' && SSL) {
+        if (SSL.host) protoCtx.push('- TLS Host: ' + asString(SSL.host));
+        if (SSL.version) protoCtx.push('- TLS Version: ' + asString(SSL.version));
+        if (SSL.ja3Hash) protoCtx.push('- JA3: ' + asString(SSL.ja3Hash));
+        if (SSL.ja3sHash) protoCtx.push('- JA3s: ' + asString(SSL.ja3sHash));
+    }
+
+    // HTTP context
+    if (typeof HTTP !== 'undefined' && HTTP) {
+        if (HTTP.host) protoCtx.push('- HTTP Host: ' + asString(HTTP.host));
+        if (HTTP.method) protoCtx.push('- HTTP Method: ' + asString(HTTP.method));
+        if (HTTP.uri) protoCtx.push('- HTTP URI: ' + asString(HTTP.uri));
+        var ua = HTTP.headers && (HTTP.headers['User-Agent'] || HTTP.headers['user-agent']);
+        if (ua) protoCtx.push('- HTTP User-Agent: ' + asString(ua));
+        var ref = HTTP.headers && (HTTP.headers['Referer'] || HTTP.headers['referer']);
+        if (ref) protoCtx.push('- HTTP Referrer: ' + asString(ref));
+    }
+
+    if (protoCtx.length) {
+        lines.push('', '## Protocol Context');
+        Array.prototype.push.apply(lines, protoCtx);
+    }
+
+    var iocCtx = [];
+    if (indicator.category) iocCtx.push('- Indicator Category: ' + asString(indicator.category));
+    if (indicator.source) iocCtx.push('- Match Source: ' + asString(indicator.source));
+    if (indicator.ruleId) iocCtx.push('- Rule ID: ' + asString(indicator.ruleId));
+    if (indicator.pattern) iocCtx.push('- Pattern: ' + asString(indicator.pattern));
+    if (iocCtx.length) {
+        lines.push('', '## IOC Context');
+        Array.prototype.push.apply(lines, iocCtx);
+    }
+
+    lines.push('', '## Observation');
+    lines.push('- Observed At: ' + asString(new Date().toISOString()));
+    if (contextLine) lines.push('- Context: ' + asString(contextLine));
+
+    return lines.join('\n');
+}
+
+function getIdentity() {
+    var id = null;
+
+    if (event === 'HTTP_REQUEST' &&
+        typeof HTTP !== 'undefined' &&
+        HTTP.headers) {
+
+        var hdrs = HTTP.headers;
+        for (var i = 0; i < HTTP_ID_HEADERS.length; i++) {
+            var h = HTTP_ID_HEADERS[i];
+            if (hdrs[h]) {
+                id = hdrs[h];
+                break;
+            }
+        }
+    }
+
+    if (!id &&
+        (event === 'AAA_REQUEST' || event === 'AAA_RESPONSE') &&
+        typeof AAA !== 'undefined' &&
+        AAA.avps && AAA.avps.length) {
+
+        for (var j = 0; j < AAA.avps.length; j++) {
+            var avp = AAA.avps[j];
+            if (!avp || !avp.name) continue;
+
+            var nameLower = ('' + avp.name).toLowerCase();
+            if (nameLower === 'user-name' ||
+                nameLower === 'username' ||
+                nameLower === 'user_name') {
+
+                if (avp.value) {
+                    id = '' + avp.value;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!id && Flow.client && Flow.client.ipaddr) {
+        id = Flow.client.ipaddr.toString();
+    }
+
+    return id ? id.toLowerCase() : null;
+}
+
+function isExcludedTraffic() {
+    var host = null;
+    var dev = null;
+    var i, j;
+
+    if (event === 'HTTP_REQUEST' &&
+        typeof HTTP !== 'undefined' &&
+        HTTP.host) {
+        host = ('' + HTTP.host).toLowerCase();
+    }
+
+    if (host && EXCLUDED_HOSTS.indexOf(host) !== -1) {
+        return true;
+    }
+
+    if (!Flow.client || !Flow.client.device) {
+        return false;
+    }
+
+    dev = Flow.client.device;
+
+    if (dev.dnsNames && dev.dnsNames.length) {
+        for (i = 0; i < dev.dnsNames.length; i++) {
+            if (!dev.dnsNames[i]) continue;
+            for (j = 0; j < EXCLUDED_HOSTS.length; j++) {
+                if (('' + dev.dnsNames[i]).toLowerCase().indexOf(EXCLUDED_HOSTS[j]) !== -1) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (dev.netbiosName) {
+        for (j = 0; j < EXCLUDED_HOSTS.length; j++) {
+            if (('' + dev.netbiosName).toLowerCase().indexOf(EXCLUDED_HOSTS[j]) !== -1) {
+                return true;
+            }
+        }
+    }
+
+    if (dev.dhcpName) {
+        for (j = 0; j < EXCLUDED_HOSTS.length; j++) {
+            if (('' + dev.dhcpName).toLowerCase().indexOf(EXCLUDED_HOSTS[j]) !== -1) {
+                return true;
+            }
+        }
+    }
+
+    if (dev.cdpName) {
+        for (j = 0; j < EXCLUDED_HOSTS.length; j++) {
+            if (('' + dev.cdpName).toLowerCase().indexOf(EXCLUDED_HOSTS[j]) !== -1) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function raiseCustomDetection(detType, title, description, identityKey) {
+    var participants = [Flow.client.offender, Flow.server.victim];
+
+    commitDetection(detType, {
+        title: title,
+        description: description,
+        categories: ['sec.caution'],
+        riskScore: 75,
+        participants: participants,
+        identityKey: identityKey,
+        identityTtl: 'day'
+    });
+}
+
+function logToSIEM(payloadObj) {
+    var msg = JSON.stringify(payloadObj);
+    Remote.Syslog(SIEM_SYSLOG_TARGET).alert(msg);
+}
+
+/******************************
+ * MAIN LOGIC
+ ******************************/
+
+if (!(event === 'HTTP_REQUEST' ||
+      event === 'SSL_OPEN'     ||
+      event === 'AAA_REQUEST'  ||
+      event === 'AAA_RESPONSE' ||
+      event === 'SSH_OPEN')) {
+    return;
+}
+
+if (!Flow.client || !Flow.client.ipaddr || Flow.client.ipaddr.isRFC1918) {
+    return;
+}
+
+if (isExcludedTraffic()) {
+    return;
+}
+
+var geo = GeoIP.getCountry(Flow.client.ipaddr);
+if (!geo || !geo.countryCode) {
+    return;
+}
+var countryCode = geo.countryCode;
+
+if (COUNTRIES_OF_CONCERN.indexOf(countryCode) === -1) {
+    return;
+}
+
+var identity = getIdentity();
+if (!identity) {
+    return;
+}
+
+var now = getTimestamp();
+
+var resource;
+if (event === 'HTTP_REQUEST' &&
+    typeof HTTP !== 'undefined' &&
+    HTTP.host && HTTP.path) {
+    resource = 'https://' + HTTP.host + HTTP.path;
+} else if (Flow.server && Flow.server.ipaddr && Flow.server.port) {
+    resource = Flow.server.ipaddr.toString() + ':' + Flow.server.port;
+} else {
+    resource = 'unknown_resource';
+}
+
+var detType = 'country_of_concern_access';
+var title = 'Access observed from country of concern';
+
+var contextLine =
+    'Identity "' + identity + '" accessed ' + resource +
+    ' from country ' + countryCode + '.';
+
+var indicator = {
+    name: 'Country of Concern Access',
+    type: 'geoip_country',
+    value: countryCode,
+    reason: 'Client IP GeoIP country is in COUNTRIES_OF_CONCERN list',
+    category: 'GeoIP',
+    source: 'GeoIP.getCountry',
+    ruleId: detType,
+    pattern: COUNTRIES_OF_CONCERN.join(',')
+};
+
+var descriptionMd = detectionDescription(indicator, contextLine);
+var identityKey = identity + ':' + countryCode;
+
+raiseCustomDetection(detType, title, descriptionMd, identityKey);
+
+logToSIEM({
+    eh_event: detType,
+    ts: new Date(now).toISOString(),
+    identity: identity,
+    src_ip: Flow.client.ipaddr.toString(),
+    src_locality: Flow.client.ipaddr.localityName || null,
+    dst_ip: Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr.toString() : null,
+    dst_locality: Flow.server && Flow.server.ipaddr ? Flow.server.ipaddr.localityName : null,
+    dst_port: Flow.server ? Flow.server.port : null,
+    country_code: countryCode,
+    resource: resource,
+    appliance_uuid: System.uuid,
+    appliance_hostname: System.hostname,
+    event_type: event,
+    l7proto: Flow.l7proto,
+    client_device_id: Flow.client && Flow.client.device ? Flow.client.device.id : null,
+    client_device_name: safeDeviceName(Flow.client && Flow.client.device ? Flow.client.device : null),
+    client_dns_names: safeHostnames(Flow.client && Flow.client.device ? Flow.client.device.dnsNames : null),
+    server_device_id: Flow.server && Flow.server.device ? Flow.server.device.id : null,
+    server_device_name: safeDeviceName(Flow.server && Flow.server.device ? Flow.server.device : null),
+    server_dns_names: safeHostnames(Flow.server && Flow.server.device ? Flow.server.device.dnsNames : null),
+    http_host: (typeof HTTP !== 'undefined' && HTTP && HTTP.host) ? HTTP.host : null,
+    http_method: (typeof HTTP !== 'undefined' && HTTP && HTTP.method) ? HTTP.method : null,
+    http_uri: (typeof HTTP !== 'undefined' && HTTP && HTTP.uri) ? HTTP.uri : null,
+    http_user_agent: (typeof HTTP !== 'undefined' && HTTP && HTTP.headers &&
+        (HTTP.headers['User-Agent'] || HTTP.headers['user-agent'])) ?
+        (HTTP.headers['User-Agent'] || HTTP.headers['user-agent']) : null,
+    http_referrer: (typeof HTTP !== 'undefined' && HTTP && HTTP.headers &&
+        (HTTP.headers['Referer'] || HTTP.headers['referer'])) ?
+        (HTTP.headers['Referer'] || HTTP.headers['referer']) : null,
+    tls_host: (typeof SSL !== 'undefined' && SSL && SSL.host) ? SSL.host : null,
+    tls_version: (typeof SSL !== 'undefined' && SSL && SSL.version) ? SSL.version : null,
+    tls_ja3: (typeof SSL !== 'undefined' && SSL && SSL.ja3Hash) ? SSL.ja3Hash : null,
+    tls_ja3s: (typeof SSL !== 'undefined' && SSL && SSL.ja3sHash) ? SSL.ja3sHash : null,
+    indicator: {
+        type: indicator.type,
+        value: indicator.value,
+        reason: indicator.reason,
+        category: indicator.category,
+        source: indicator.source,
+        ruleId: indicator.ruleId
+    },
+    description_md: descriptionMd,
+    context: contextLine
+});
