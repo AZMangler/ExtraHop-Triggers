@@ -1,0 +1,382 @@
+/*
+ * Name: Custom Detection: HTTP/2 Bomb (HPACK + Slow Read) DoS
+ *
+ * Description:
+ *   Behavioral detection for the "HTTP/2 Bomb" exploit chain disclosed June 2026
+ *   (CVE-2026-49975 + HPACK Bomb family CVE-2016-6581 / CVE-2025-53020 + HTTP/2
+ *   Slowloris CVE-2016-8740 / CVE-2016-1546). The exploit combines per-entry
+ *   HPACK bookkeeping amplification (large counts of nearly-empty headers) with
+ *   a Slowloris-style hold (zero-byte flow-control window + suppressed send
+ *   timeout) to pin server memory and crash HTTP/2 web servers within seconds.
+ *
+ *   This trigger inspects completed and reset HTTP/2 transactions and scores
+ *   them against four behavioral signals derived from documented ExtraHop fields:
+ *     (1) excessive decoded header count on the request,
+ *     (2) abnormally long server processingTime,
+ *     (3) HTTP/2 client-initiated stream reset (HTTP.isClientReset),
+ *     (4) tiny request bytes coupled with long hold time.
+ *   A detection is raised when >= MIN_SIGNALS distinct signals fire on a
+ *   single HTTP/2 transaction, or when a single external offender accumulates
+ *   >= OFFENDER_BURST_THRESHOLD scored transactions within OFFENDER_TTL.
+ *
+ *   Directionality: Ingress (Inbound) - external client to internal HTTP/2 server.
+ *   Lateral and egress matches are also surfaced but recorded with their actual
+ *   computed direction so analysts can triage internal misuse separately.
+ *
+ * Events:
+ *   HTTP_REQUEST
+ *   HTTP_RESPONSE
+ *
+ * Assignments:
+ *   Recommended initial scope: a small device group of internet-facing HTTP/2
+ *   web servers (NGINX, Apache HTTPD, IIS, Envoy, Cloudflare Pingora gateways).
+ *   Recommended production scope: "HTTP Servers" device activity group OR a
+ *   custom "DMZ HTTP/2 Servers" group. Avoid "All Devices" - this trigger only
+ *   fires on HTTP/2 flows but the HTTP_REQUEST/HTTP_RESPONSE events run on
+ *   every HTTP transaction and broad assignment wastes capture CPU.
+ *
+ * Configuration Requirements:
+ *   - Minimum firmware: Reveal(x) 360 / 9.x+ (HTTP.isClientReset and
+ *     commitDetection are both documented through 26.1).
+ *   - No payload buffering required. Do NOT enable "L7 Payload Bytes to Buffer".
+ *   - Privileges: write/save triggers, manage detections (for commitDetection).
+ *   - Sensor type: EDA (commitDetection is sensor-side); ECA falls back to
+ *     commitRecord automatically via the feature-detection guard.
+ *   - No DNS used -> Palo Alto sinkhole exclusion (198.135.184.22 /
+ *     sinkhole.paloaltonetworks.com) does not apply.
+ *
+ * Notes:
+ *   - Thresholds are tunable in the CONFIG block. Defaults are conservative:
+ *     HEADER_COUNT_THRESHOLD=200 (RFC 9113 typical browsers send <50),
+ *     PROCESSING_TIME_MS_THRESHOLD=15000 (15s; normal HTTP/2 responses well
+ *     under 5s), TINY_REQ_BYTES=512.
+ *   - Deduplication: identityKey is per (client IP, server IP, server port) and
+ *     identityTtl='hour' to consolidate sustained attack bursts.
+ *   - Per-flow scoring values are also written into the Markdown description so
+ *     analysts can triage from the detection card without a separate properties
+ *     payload (commitDetection input options do not accept a 'properties' field).
+ *   - DEBUG flag is OFF by default. Enable only for tuning.
+ */
+
+// ============================================================
+// CONFIG
+// ============================================================
+const DEBUG = false;
+
+const HEADER_COUNT_THRESHOLD       = 200;     // signal 1: HPACK bookkeeping amplification
+const PROCESSING_TIME_MS_THRESHOLD = 15000;   // signal 2: Slow Read hold (15 s)
+const TINY_REQ_BYTES               = 512;     // signal 4 bound: "small wire, large effect"
+const TINY_REQ_HOLD_MS             = 5000;    // signal 4 bound: held > 5 s with tiny request
+
+const MIN_SIGNALS                  = 2;       // raise detection if N or more signals fire
+
+const OFFENDER_BURST_THRESHOLD     = 10;      // per-source escalation
+const OFFENDER_TTL_SEC             = 90;
+const DETECTION_TTL                = 'hour';  // valid values: 'hour' | 'day' | 'week'
+
+// ============================================================
+// HELPERS  (defined at top per ExtraHop best practices)
+// ============================================================
+function asString(x) {
+    if (x === null || x === undefined) return '';
+    return String(x);
+}
+
+function safeDeviceName(device) {
+    if (!device) return '';
+    if (device.name) return String(device.name);
+    if (device.dnsNames && device.dnsNames.length > 0) return String(device.dnsNames[0]);
+    return '';
+}
+
+function safeHostnames(arr) {
+    if (!arr) return '';
+    let out = [];
+    for (let i = 0; i < arr.length; i++) {
+        if (arr[i]) out.push(String(arr[i]));
+    }
+    return out.join(', ');
+}
+
+function isHttp2(proto) {
+    if (!proto) return false;
+    let p = String(proto).toLowerCase();
+    return p.indexOf('http2') !== -1 || p.indexOf('h2') === 0;
+}
+
+function countHeaders(h) {
+    if (!h) return 0;
+    let n = 0;
+    for (let k in h) { if (h.hasOwnProperty(k)) n++; }
+    return n;
+}
+
+function classifyDirection(iocMatchSide, isDnsQuery) {
+    let cLoc = '';
+    let sLoc = '';
+    if (typeof Flow !== 'undefined') {
+        if (Flow.client && Flow.client.ipaddr) {
+            cLoc = String(Flow.client.ipaddr.localityName || '');
+        }
+        if (Flow.server && Flow.server.ipaddr) {
+            sLoc = String(Flow.server.ipaddr.localityName || '');
+        }
+    }
+    if (isDnsQuery && cLoc === 'internal') return 'Egress (Outbound)';
+    if (iocMatchSide === 'server' && cLoc === 'internal') return 'Egress (Outbound)';
+    if (iocMatchSide === 'client' && cLoc === 'external' && sLoc === 'internal') return 'Ingress (Inbound)';
+    if (cLoc === 'internal' && sLoc === 'internal') return 'Lateral (East-West)';
+    return 'Unknown';
+}
+
+function detectionDescription(indicator, contextLine, direction) {
+    let lines = [
+        'Observed behavioral signals consistent with the ' + asString(indicator.campaign || indicator.name || 'HTTP/2 Bomb') + ' exploit chain.',
+        '',
+        '## Indicator',
+        '- Type: ' + asString(indicator.type),
+        '- Value: ' + asString(indicator.value),
+        '- Reason: ' + asString(indicator.reason),
+        '',
+        '## Flow',
+        '- Event: ' + asString(event),
+        '- Protocol: ' + asString((typeof Flow !== 'undefined' && Flow.l7proto) ? Flow.l7proto : ''),
+        '- Client IP: ' + asString((typeof Flow !== 'undefined' && Flow.client) ? String(Flow.client.ipaddr) : ''),
+        '- Client Port: ' + asString((typeof Flow !== 'undefined' && Flow.client) ? Flow.client.port : ''),
+        '- Server IP: ' + asString((typeof Flow !== 'undefined' && Flow.server) ? String(Flow.server.ipaddr) : ''),
+        '- Server Port: ' + asString((typeof Flow !== 'undefined' && Flow.server) ? Flow.server.port : ''),
+        '- VLAN: ' + asString((typeof Flow !== 'undefined' && Flow.vlan) ? Flow.vlan : ''),
+        '- Client Locality: ' + asString((typeof Flow !== 'undefined' && Flow.client && Flow.client.ipaddr) ? String(Flow.client.ipaddr.localityName || '') : ''),
+        '- Server Locality: ' + asString((typeof Flow !== 'undefined' && Flow.server && Flow.server.ipaddr) ? String(Flow.server.ipaddr.localityName || '') : ''),
+        '- Traffic Direction: ' + asString(direction),
+        '',
+        '## Device Context',
+        '- Client Device ID: ' + asString((typeof Flow !== 'undefined' && Flow.client && Flow.client.device) ? Flow.client.device.id : ''),
+        '- Client Device Name: ' + safeDeviceName((typeof Flow !== 'undefined' && Flow.client && Flow.client.device) ? Flow.client.device : null),
+        '- Client DNS Names: ' + safeHostnames((typeof Flow !== 'undefined' && Flow.client && Flow.client.device) ? Flow.client.device.dnsNames : null),
+        '- Server Device ID: ' + asString((typeof Flow !== 'undefined' && Flow.server && Flow.server.device) ? Flow.server.device.id : ''),
+        '- Server Device Name: ' + safeDeviceName((typeof Flow !== 'undefined' && Flow.server && Flow.server.device) ? Flow.server.device : null),
+        '- Server DNS Names: ' + safeHostnames((typeof Flow !== 'undefined' && Flow.server && Flow.server.device) ? Flow.server.device.dnsNames : null)
+    ];
+
+    let protoCtx = [];
+    if (typeof HTTP !== 'undefined') {
+        if (HTTP.host) protoCtx.push('- HTTP Host: ' + asString(HTTP.host));
+        if (HTTP.method) protoCtx.push('- HTTP Method: ' + asString(HTTP.method));
+        if (HTTP.uri) protoCtx.push('- HTTP URI: ' + asString(HTTP.uri));
+        if (HTTP.statusCode) protoCtx.push('- HTTP Status: ' + asString(HTTP.statusCode));
+        if (HTTP.processingTime) protoCtx.push('- HTTP processingTime (ms): ' + asString(HTTP.processingTime));
+        if (HTTP.isClientReset === true) protoCtx.push('- HTTP/2 Client Reset: true');
+        if (HTTP.reqL2Bytes) protoCtx.push('- Request L2 Bytes: ' + asString(HTTP.reqL2Bytes));
+        if (HTTP.rspL2Bytes) protoCtx.push('- Response L2 Bytes: ' + asString(HTTP.rspL2Bytes));
+        if (HTTP.headers) {
+            let hdrCount = countHeaders(HTTP.headers);
+            protoCtx.push('- HTTP Header Count (decoded): ' + asString(hdrCount));
+            let ua = HTTP.headers['User-Agent'] || HTTP.headers['user-agent'];
+            if (ua) protoCtx.push('- HTTP User-Agent: ' + asString(ua));
+        }
+    }
+    // NOTE: SSL.* is intentionally not referenced here. The SSL global is not
+    // in scope on HTTP_REQUEST/HTTP_RESPONSE events per the ExtraHop SDK type
+    // definitions, which would cause TypeScript errors in the trigger editor.
+    if (protoCtx.length) {
+        lines.push('', '## Protocol Context');
+        for (let i = 0; i < protoCtx.length; i++) { lines.push(protoCtx[i]); }
+    }
+
+    let iocCtx = [];
+    if (indicator.category) iocCtx.push('- Indicator Category: ' + asString(indicator.category));
+    if (indicator.source) iocCtx.push('- Match Source: ' + asString(indicator.source));
+    if (indicator.ruleId) iocCtx.push('- Rule ID: ' + asString(indicator.ruleId));
+    if (indicator.pattern) iocCtx.push('- Pattern: ' + asString(indicator.pattern));
+    if (indicator.signals) iocCtx.push('- Signals Tripped: ' + asString(indicator.signals));
+    if (indicator.signalCount !== undefined) iocCtx.push('- Signal Count: ' + asString(indicator.signalCount));
+    if (iocCtx.length) {
+        lines.push('', '## IOC Context');
+        for (let i = 0; i < iocCtx.length; i++) { lines.push(iocCtx[i]); }
+    }
+
+    lines.push('', '## Observation');
+    lines.push('- Observed At: ' + asString(new Date().toISOString()));
+    lines.push('- Traffic Direction: ' + asString(direction));
+    if (contextLine) lines.push('- Context: ' + asString(contextLine));
+
+    return lines.join('\n');
+}
+
+function tryCommit(title, description, identityKey, indicator) {
+    if (typeof commitDetection === 'function') {
+        // Per ExtraHop 26.1 Trigger API Reference, participants must be passed as
+        // Flow endpoint role objects (e.g., Flow.client.offender, Flow.server.victim)
+        // directly - not as {object, role} wrapper objects (that is the read form
+        // returned by Detection.participants, not the input form).
+        let participants = [];
+        if (typeof Flow !== 'undefined' && Flow.client && Flow.client.offender) {
+            participants.push(Flow.client.offender);
+        }
+        if (typeof Flow !== 'undefined' && Flow.server && Flow.server.victim) {
+            participants.push(Flow.server.victim);
+        }
+        // NOTE: commitDetection input options do NOT accept a 'properties' field
+        // (only title, description, riskScore, participants, identityKey,
+        // identityTtl, mitreTechniques). Per-flow scoring values are surfaced
+        // inside the Markdown description instead.
+        commitDetection('http2_bomb_dos', {
+            title: title,
+            description: description,
+            participants: participants,
+            identityKey: identityKey,
+            identityTtl: DETECTION_TTL,
+            riskScore: 80
+        });
+        if (DEBUG) debug('commitDetection: ' + title);
+        return;
+    }
+    // Fallback when commitDetection unavailable (e.g., on ECA or restricted sensor)
+    if (DEBUG) debug('commitDetection not available; falling back to commitRecord');
+    let rec = {
+        detection_type: 'http2_bomb_dos',
+        title: title,
+        description: description,
+        identity_key: identityKey,
+        signals: indicator.signals,
+        signal_count: indicator.signalCount,
+        header_count: indicator.headerCount,
+        processing_time_ms: indicator.processingTime,
+        is_client_reset: indicator.isClientReset,
+        req_bytes: indicator.reqBytes,
+        resp_bytes: indicator.respBytes
+    };
+    try { commitRecord('http2_bomb_dos', rec); } catch (e) { if (DEBUG) debug('commitRecord failed: ' + e); }
+    // Always emit a metric so dashboards still see the match
+    try { Device.metricAddCount('http2_bomb_dos_match', 1); } catch (e2) { /* no-op */ }
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+if (typeof HTTP === 'undefined' || typeof Flow === 'undefined') {
+    return;
+}
+
+// Protocol guard: only HTTP/2
+if (!isHttp2(Flow.l7proto)) {
+    return;
+}
+
+if (event === 'HTTP_REQUEST') {
+    // Capture per-request signals that are only visible at request time.
+    let hdrCount = countHeaders(HTTP.headers);
+    let reqBytes = (typeof HTTP.reqL2Bytes === 'number') ? HTTP.reqL2Bytes : 0;
+
+    // Persist just the scalar values we need on the response side.
+    Flow.store['h2bomb_hdrCount'] = hdrCount;
+    Flow.store['h2bomb_reqBytes'] = reqBytes;
+    return;
+}
+
+// event === 'HTTP_RESPONSE'
+let hdrCount   = (Flow.store['h2bomb_hdrCount'] !== undefined) ? Flow.store['h2bomb_hdrCount'] : countHeaders(HTTP.headers);
+let reqBytes   = (Flow.store['h2bomb_reqBytes'] !== undefined) ? Flow.store['h2bomb_reqBytes'] : 0;
+let procTime   = (typeof HTTP.processingTime === 'number') ? HTTP.processingTime : 0;
+let isReset    = (HTTP.isClientReset === true);
+let respBytes  = (typeof HTTP.rspL2Bytes === 'number') ? HTTP.rspL2Bytes : 0;
+
+// Clear Flow.store fields to prevent bleed-over and conserve memory (per best practices).
+Flow.store['h2bomb_hdrCount'] = null;
+Flow.store['h2bomb_reqBytes'] = null;
+
+let signals = [];
+
+// Signal 1: HPACK per-entry bookkeeping amplification
+if (hdrCount >= HEADER_COUNT_THRESHOLD) {
+    signals.push('header_count=' + hdrCount);
+}
+
+// Signal 2: Slow Read / hold
+if (procTime >= PROCESSING_TIME_MS_THRESHOLD) {
+    signals.push('processing_time_ms=' + procTime);
+}
+
+// Signal 3: HTTP/2 client-initiated stream reset
+if (isReset) {
+    signals.push('http2_client_reset=true');
+}
+
+// Signal 4: tiny wire-side request that pinned the server for several seconds
+if (reqBytes > 0 && reqBytes <= TINY_REQ_BYTES && procTime >= TINY_REQ_HOLD_MS) {
+    signals.push('tiny_req_long_hold(req=' + reqBytes + 'B,proc=' + procTime + 'ms)');
+}
+
+if (signals.length === 0) {
+    return;
+}
+
+let direction = classifyDirection('client', false);
+
+// Per-offender cross-flow counter (only for genuine ingress; suppress noise for
+// internal east-west or unknown locality).
+let offenderKey = null;
+let offenderCount = 0;
+if (typeof Session !== 'undefined' && Flow.client && Flow.client.ipaddr) {
+    offenderKey = 'h2bomb_offender_' + String(Flow.client.ipaddr);
+    try {
+        let prior = Session.lookup(offenderKey);
+        offenderCount = (prior && typeof prior.value === 'number') ? prior.value : 0;
+        offenderCount += 1;
+        Session.add(offenderKey, offenderCount, { expire: OFFENDER_TTL_SEC, priority: Session.PRIORITY_LOW });
+    } catch (e) {
+        if (DEBUG) debug('Session counter failed: ' + e);
+    }
+}
+
+// Decide whether to raise a detection.
+let raise = false;
+let reasonParts = [];
+if (signals.length >= MIN_SIGNALS) {
+    raise = true;
+    reasonParts.push(signals.length + ' behavioral signals tripped on a single HTTP/2 transaction');
+}
+if (offenderCount >= OFFENDER_BURST_THRESHOLD) {
+    raise = true;
+    reasonParts.push(offenderCount + ' scored transactions from this source within ' + OFFENDER_TTL_SEC + 's');
+}
+
+if (!raise) {
+    return;
+}
+
+let indicator = {
+    name: 'HTTP/2 Bomb',
+    campaign: 'HTTP/2 Bomb (CVE-2026-49975 / HPACK Bomb family)',
+    type: 'behavioral_http2_dos',
+    value: 'HTTP/2 transaction matched ' + signals.length + ' of 4 DoS signals',
+    reason: reasonParts.join('; '),
+    category: 'sec.dos',
+    source: 'extrahop_trigger',
+    ruleId: 'http2_bomb_dos_v1',
+    pattern: 'header_count>=' + HEADER_COUNT_THRESHOLD +
+             ' OR processingTime>=' + PROCESSING_TIME_MS_THRESHOLD + 'ms' +
+             ' OR HTTP/2 client reset OR tiny request held >= ' + TINY_REQ_HOLD_MS + 'ms',
+    signals: signals.join(' | '),
+    signalCount: signals.length,
+    headerCount: hdrCount,
+    processingTime: procTime,
+    isClientReset: isReset,
+    reqBytes: reqBytes,
+    respBytes: respBytes
+};
+
+let title = 'HTTP/2 Bomb DoS - ' + signals.length + ' signal(s)' +
+            (offenderCount >= OFFENDER_BURST_THRESHOLD ? ' + offender burst' : '');
+
+let identityKey = 'h2bomb:' +
+                  String((Flow.client && Flow.client.ipaddr) ? Flow.client.ipaddr : 'unk') + ':' +
+                  String((Flow.server && Flow.server.ipaddr) ? Flow.server.ipaddr : 'unk') + ':' +
+                  String((Flow.server && Flow.server.port) ? Flow.server.port : 'unk');
+
+let description = detectionDescription(indicator,
+    reasonParts.join('; ') + (offenderCount > 0 ? ' (offender_count=' + offenderCount + ')' : ''),
+    direction);
+
+tryCommit(title, description, identityKey, indicator);
