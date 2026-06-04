@@ -1,0 +1,611 @@
+/*
+ * Name: Custom Detection: Defender-Blinded Host with New C2 / Beaconing
+ *
+ * Description:
+ *   Pairs two cross-flow signals on the same internal device to detect a likely
+ *   compromise where endpoint EDR (Microsoft Defender for Endpoint) telemetry
+ *   has gone silent and the same host is now exhibiting low-jitter, low-volume
+ *   beacon-style egress to a previously unseen external destination.
+ *
+ *   Signal A (Defender silence): tracks the last time each internal device
+ *   contacted a known Microsoft Defender telemetry / update endpoint via DNS
+ *   qname, HTTP host, or TLS SNI (domain-boundary match). A device is
+ *   "Defender-blinded" when it previously had at least one such contact
+ *   (baseline established) but has not had one for SILENCE_MS.
+ *
+ *   Signal B (New C2 / beaconing): on FLOW_RECORD for egress flows (internal
+ *   client -> external server), maintains per device->dest beacon series in
+ *   the Session table. When the destination is first observed within
+ *   FIRSTSEEN_TTL and the flow series exhibits beacon-like behavior
+ *   (>= MIN_COUNT samples, mean interval inside [MIN_PERIOD_MS, MAX_PERIOD_MS],
+ *   coefficient of variation < CV_MAX, all samples below MAX_BYTES), Signal B
+ *   is asserted for that (device, dest) pair.
+ *
+ *   When both signals hold on the same flow the trigger emits a single
+ *   deduplicated Reveal(x) Detection via commitDetection() with the internal
+ *   device as victim and external server as offender, with graceful
+ *   commitRecord('defender_blinded_c2_match', ...) fallback on FLOW_RECORD
+ *   and a custom metric for dashboard visibility.
+ *
+ * Events:
+ *   DNS_REQUEST
+ *   DNS_RESPONSE
+ *   HTTP_REQUEST
+ *   SSL_OPEN
+ *   FLOW_RECORD
+ *
+ * Assignments:
+ *   Assign to "All Devices" or a device group scoping the trigger to internal
+ *   workstation/server VLANs where Defender for Endpoint is expected. Avoid
+ *   perimeter-only and guest-VLAN groups (Signal A needs the protected device
+ *   population in scope).
+ *
+ * Configuration Requirements:
+ *   - Reveal(x) 360 / firmware 9.x+ (audited against 26.1 Trigger API).
+ *   - No payload buffering required (header fields only).
+ *   - Requires Session table writes (default privileges on EDA/ECA sensors).
+ *   - Requires detection-create privileges for commitDetection(); falls back
+ *     to the global commitRecord('defender_blinded_c2_match', ...) on
+ *     FLOW_RECORD if unavailable or when victim/offender objects are missing.
+ *   - Known exclusions: Palo Alto DNS sinkhole (198.135.184.22 and
+ *     sinkhole.paloaltonetworks.com) are skipped so sinkholed lookups do not
+ *     pollute Defender baseline or beacon counters.
+ *
+ * Notes:
+ *   - Defender domain list is a static array near the top of the script. Tune
+ *     for your environment (e.g., add tenant-specific winatp-gw URLs).
+ *   - All thresholds (SILENCE_MS, MIN_COUNT, MIN/MAX_PERIOD_MS, CV_MAX,
+ *     MAX_BYTES, FIRSTSEEN_TTL_S) are constants at the top for easy tuning.
+ *   - Cross-flow correlation uses the Session table with explicit per-key TTL
+ *     and PRIORITY_LOW to avoid evicting higher-priority entries.
+ *   - Beacon sample window capped at MAX_SAMPLES recent intervals to bound
+ *     memory; older intervals are dropped FIFO.
+ *   - Detection dedup uses identityKey = deviceId|destIp|YYYY-MM-DD with
+ *     identityTtl 'day' so analysts see one detection per day per pair.
+ *   - Record/metric fields use native IPAddress / Device objects (not strings)
+ *     so the recordstore can filter/sort by attribute.
+ *   - DEBUG flag is off in production; flip to true only for short-term
+ *     troubleshooting.
+ *   - Doc audit: Verified against ExtraHop 26.1 Trigger API Reference on
+ *     2026-06-04. TS-validator corrections in this revision:
+ *       * Revision 4: SSL.serverName/JA3/JA3s/cipherSuite -> SSL.host
+ *         (26.1 editor schema); HTTP.headers['User-Agent'] ->
+ *         HTTP.findHeaders('User-Agent'); DNS.rcode -> DNS.error; removed
+ *         GeoIP.getCountry/getAsn calls (not in editor .d.ts);
+ *         Flow.client.commitRecord -> global commitRecord on FLOW_RECORD;
+ *         refactored metricAddCount &&-chain into nested ifs; removed
+ *         `|| ans[ai]` object-stringify fallback in DNS_RESPONSE.
+ *       * Revision 5 (TS validator): removed SSL.protocol and HTTP.statusCode
+ *         references (not in 26.1 editor .d.ts); inlined commitDetection
+ *         participants array literal so role narrows to "victim"|"offender";
+ *         commitDetection now requires both victim and offender objects, else
+ *         falls through to commitRecord.
+ */
+
+/* ============================ Configuration ============================ */
+
+const DEBUG = false;
+
+const SILENCE_MS = 6 * 3600 * 1000;          /* 6 hours */
+
+const MIN_COUNT       = 4;
+const MIN_PERIOD_MS   = 30 * 1000;
+const MAX_PERIOD_MS   = 30 * 60 * 1000;
+const CV_MAX          = 0.30;
+const MAX_BYTES       = 50 * 1024;
+const MAX_SAMPLES     = 8;
+const FIRSTSEEN_TTL_S = 7 * 24 * 3600;
+const DEFENDER_SEEN_TTL_S = 14 * 24 * 3600;
+const BEACON_TTL_S    = 24 * 3600;
+
+const RISK_SCORE = 70;
+
+const K_DEF_SEEN  = 'dblc:dfseen:';
+const K_DEF_EVER  = 'dblc:dfever:';
+const K_FIRSTSEEN = 'dblc:fs:';
+const K_BEACON    = 'dblc:bc:';
+
+const SINKHOLE_IP    = '198.135.184.22';
+const SINKHOLE_QNAME = 'sinkhole.paloaltonetworks.com';
+
+const DEFENDER_DOMAINS = [
+    'wdcp.microsoft.com',
+    'wdcpalt.microsoft.com',
+    'wd.microsoft.com',
+    'events.data.microsoft.com',
+    'definitionupdates.microsoft.com',
+    'update.microsoft.com',
+    'windowsupdate.com',
+    'security.microsoft.com',
+    'endpoint.security.microsoft.com',
+    'protection.outlook.com'
+];
+
+const DEFENDER_REGEX = /^winatp-gw-[a-z0-9-]+\.microsoft\.com$/;
+
+/* ============================== Helpers ================================ */
+
+function dbg(msg) {
+    if (DEBUG) { debug('[defender-blinded-c2] ' + msg); }
+}
+
+function asString(x) {
+    if (x === null || typeof x === 'undefined') { return ''; }
+    try { return String(x); } catch (e) { return ''; }
+}
+
+function safeDeviceName(device) {
+    if (!device) { return ''; }
+    try {
+        if (device.name) { return String(device.name); }
+        if (device.dnsNames && device.dnsNames.length) { return String(device.dnsNames[0]); }
+        if (device.dhcpName) { return String(device.dhcpName); }
+        return '';
+    } catch (e) { return ''; }
+}
+
+function safeHostnames(arr) {
+    if (!arr || !arr.length) { return ''; }
+    try {
+        const out = [];
+        for (let i = 0; i < arr.length && i < 5; i++) { out.push(String(arr[i])); }
+        return out.join(',');
+    } catch (e) { return ''; }
+}
+
+function getHttpHeader(name) {
+    if (typeof HTTP === 'undefined') { return ''; }
+    try {
+        if (typeof HTTP.findHeaders === 'function') {
+            const found = HTTP.findHeaders(name);
+            if (found && found.length) {
+                const h0 = found[0];
+                if (h0 && h0.value) { return String(h0.value); }
+                return String(h0);
+            }
+        }
+    } catch (e) { /* swallow */ }
+    return '';
+}
+
+function clientLocality() {
+    if (typeof Flow === 'undefined') { return ''; }
+    if (Flow.client && Flow.client.ipaddr) {
+        return String(Flow.client.ipaddr.localityName || '');
+    }
+    return '';
+}
+
+function serverLocality() {
+    if (typeof Flow === 'undefined') { return ''; }
+    if (Flow.server && Flow.server.ipaddr) {
+        return String(Flow.server.ipaddr.localityName || '');
+    }
+    return '';
+}
+
+function classifyDirection(iocMatchSide, isDnsQuery) {
+    const cLoc = clientLocality();
+    const sLoc = serverLocality();
+    if (isDnsQuery && cLoc === 'internal') { return 'Egress (Outbound)'; }
+    if (iocMatchSide === 'server' && cLoc === 'internal') { return 'Egress (Outbound)'; }
+    if (iocMatchSide === 'client' && cLoc === 'external' && sLoc === 'internal') {
+        return 'Ingress (Inbound)';
+    }
+    if (cLoc === 'internal' && sLoc === 'internal') { return 'Lateral (East-West)'; }
+    return 'Unknown';
+}
+
+function matchesDefenderDomain(host) {
+    if (!host) { return false; }
+    const h = String(host).toLowerCase();
+    for (let i = 0; i < DEFENDER_DOMAINS.length; i++) {
+        const d = DEFENDER_DOMAINS[i];
+        if (h === d) { return true; }
+        if ((h.length > (d.length + 1)) &&
+            (h.substring(h.length - d.length - 1) === ('.' + d))) {
+            return true;
+        }
+    }
+    if (DEFENDER_REGEX.test(h)) { return true; }
+    return false;
+}
+
+function clientDeviceKey() {
+    if (typeof Flow === 'undefined') { return ''; }
+    if (Flow.client && Flow.client.device && Flow.client.device.id) {
+        return String(Flow.client.device.id);
+    }
+    if (Flow.client && Flow.client.ipaddr) { return String(Flow.client.ipaddr); }
+    return '';
+}
+
+function serverIpKey() {
+    if (typeof Flow === 'undefined') { return ''; }
+    if (Flow.server && Flow.server.ipaddr) { return String(Flow.server.ipaddr); }
+    return '';
+}
+
+function sessGet(key) {
+    if (typeof Session === 'undefined') { return null; }
+    try { return Session.lookup(key); } catch (e) { return null; }
+}
+
+function sessPut(key, value, ttlSeconds) {
+    if (typeof Session === 'undefined') { return; }
+    try {
+        Session.replace(key, value, { expire: ttlSeconds, priority: Session.PRIORITY_LOW });
+    } catch (e) { /* swallow */ }
+}
+
+function parseSeries(s) {
+    if (!s) { return []; }
+    const parts = String(s).split(',');
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+        const n = parseInt(parts[i], 10);
+        if (!isNaN(n) && n > 0) { out.push(n); }
+    }
+    return out;
+}
+
+function serializeSeries(arr) {
+    if (!arr || !arr.length) { return ''; }
+    let s = '';
+    for (let i = 0; i < arr.length; i++) {
+        if (i > 0) { s += ','; }
+        s += String(arr[i]);
+    }
+    return s;
+}
+
+function evalBeacon(series) {
+    const n = series.length;
+    if (n < MIN_COUNT) { return { fits: false, count: n, meanMs: 0, cv: 0 }; }
+    const intervals = [];
+    for (let i = 1; i < n; i++) {
+        const iv = series[i] - series[i - 1];
+        if (iv > 0) { intervals.push(iv); }
+    }
+    if (intervals.length < (MIN_COUNT - 1)) {
+        return { fits: false, count: n, meanMs: 0, cv: 0 };
+    }
+    let sum = 0;
+    for (let j = 0; j < intervals.length; j++) { sum += intervals[j]; }
+    const mean = sum / intervals.length;
+    if (mean < MIN_PERIOD_MS || mean > MAX_PERIOD_MS) {
+        return { fits: false, count: n, meanMs: mean, cv: 0 };
+    }
+    let varSum = 0;
+    for (let k = 0; k < intervals.length; k++) {
+        const diff = intervals[k] - mean;
+        varSum += diff * diff;
+    }
+    const stddev = Math.sqrt(varSum / intervals.length);
+    const cv = mean > 0 ? (stddev / mean) : 1;
+    return { fits: (cv < CV_MAX), count: n, meanMs: mean, cv: cv };
+}
+
+function dayStamp(ms) {
+    const d = new Date(ms);
+    const y = d.getUTCFullYear();
+    const m = d.getUTCMonth() + 1;
+    const dd = d.getUTCDate();
+    return String(y) + '-' + (m < 10 ? '0' + m : String(m)) + '-' + (dd < 10 ? '0' + dd : String(dd));
+}
+
+/* ====================== Defender Signal Bookkeeping =================== */
+
+function markDefenderContact(host, eventTag) {
+    if (clientLocality() !== 'internal') { return; }
+    const devKey = clientDeviceKey();
+    if (!devKey) { return; }
+    const now = getTimestamp();
+    sessPut(K_DEF_SEEN + devKey, String(now), DEFENDER_SEEN_TTL_S);
+    sessPut(K_DEF_EVER + devKey, '1', DEFENDER_SEEN_TTL_S);
+    dbg('Defender contact (' + eventTag + ') host=' + host + ' device=' + devKey);
+}
+
+/* ============================= Enrichment ============================== */
+
+function detectionDescription(indicator, contextLine, direction, beacon, silentMs) {
+    const lines = [];
+    lines.push('Observed network activity associated with ' +
+        asString(indicator.campaign || indicator.name || 'provided') + ' indicators.');
+    lines.push('');
+    lines.push('## Indicator');
+    lines.push('- Type: ' + asString(indicator.type));
+    lines.push('- Value: ' + asString(indicator.value));
+    lines.push('- Reason: ' + asString(indicator.reason));
+    lines.push('');
+    lines.push('## Flow');
+    lines.push('- Event: ' + asString(event));
+    lines.push('- Protocol: ' + asString(Flow.l7proto || ''));
+    lines.push('- Client IP: ' + asString(Flow.client ? Flow.client.ipaddr : ''));
+    lines.push('- Client Port: ' + asString(Flow.client ? Flow.client.port : ''));
+    lines.push('- Server IP: ' + asString(Flow.server ? Flow.server.ipaddr : ''));
+    lines.push('- Server Port: ' + asString(Flow.server ? Flow.server.port : ''));
+    lines.push('- VLAN: ' + asString(Flow.vlan || ''));
+    lines.push('- Client Locality: ' + asString((Flow.client && Flow.client.ipaddr) ?
+        String(Flow.client.ipaddr.localityName || '') : ''));
+    lines.push('- Server Locality: ' + asString((Flow.server && Flow.server.ipaddr) ?
+        String(Flow.server.ipaddr.localityName || '') : ''));
+    lines.push('- Traffic Direction: ' + asString(direction));
+    lines.push('');
+    lines.push('## Device Context');
+    lines.push('- Client Device ID: ' + asString((Flow.client && Flow.client.device) ?
+        Flow.client.device.id : ''));
+    lines.push('- Client Device Name: ' + safeDeviceName((Flow.client && Flow.client.device) ?
+        Flow.client.device : null));
+    lines.push('- Client DNS Names: ' + safeHostnames((Flow.client && Flow.client.device) ?
+        Flow.client.device.dnsNames : null));
+    lines.push('- Server Device ID: ' + asString((Flow.server && Flow.server.device) ?
+        Flow.server.device.id : ''));
+    lines.push('- Server Device Name: ' + safeDeviceName((Flow.server && Flow.server.device) ?
+        Flow.server.device : null));
+    lines.push('- Server DNS Names: ' + safeHostnames((Flow.server && Flow.server.device) ?
+        Flow.server.device.dnsNames : null));
+
+    const protoCtx = [];
+    if (typeof SSL !== 'undefined') {
+        if (SSL.host) { protoCtx.push('- TLS Host (SNI): ' + asString(SSL.host)); }
+    }
+    if (typeof HTTP !== 'undefined') {
+        if (HTTP.host)   { protoCtx.push('- HTTP Host: '   + asString(HTTP.host)); }
+        if (HTTP.method) { protoCtx.push('- HTTP Method: ' + asString(HTTP.method)); }
+        if (HTTP.uri)    { protoCtx.push('- HTTP URI: '    + asString(HTTP.uri)); }
+        const ua  = getHttpHeader('User-Agent');
+        if (ua)  { protoCtx.push('- HTTP User-Agent: ' + asString(ua)); }
+        const ref = getHttpHeader('Referer');
+        if (ref) { protoCtx.push('- HTTP Referrer: '   + asString(ref)); }
+    }
+    if (typeof DNS !== 'undefined') {
+        if (DNS.qname)   { protoCtx.push('- DNS QNAME: ' + asString(DNS.qname)); }
+        if (DNS.qtype)   { protoCtx.push('- DNS QTYPE: ' + asString(DNS.qtype)); }
+        if (DNS.answers) { protoCtx.push('- DNS RDATA: ' + asString(DNS.answers)); }
+        if (DNS.error)   { protoCtx.push('- DNS Error: ' + asString(DNS.error)); }
+    }
+    if (protoCtx.length) {
+        lines.push('');
+        lines.push('## Protocol Context');
+        for (let pi = 0; pi < protoCtx.length; pi++) { lines.push(protoCtx[pi]); }
+    }
+
+    const iocCtx = [];
+    if (indicator.category) { iocCtx.push('- Indicator Category: ' + asString(indicator.category)); }
+    if (indicator.source)   { iocCtx.push('- Match Source: '       + asString(indicator.source));   }
+    if (indicator.ruleId)   { iocCtx.push('- Rule ID: '            + asString(indicator.ruleId));   }
+    if (indicator.pattern)  { iocCtx.push('- Pattern: '            + asString(indicator.pattern));  }
+    if (iocCtx.length) {
+        lines.push('');
+        lines.push('## IOC Context');
+        for (let ii = 0; ii < iocCtx.length; ii++) { lines.push(iocCtx[ii]); }
+    }
+
+    const vulnCtx = [];
+    if (indicator.cve)        { vulnCtx.push('- CVE ID: '            + asString(indicator.cve)); }
+    if (indicator.cvss)       { vulnCtx.push('- CVSS Score: '        + asString(indicator.cvss)); }
+    if (indicator.severity)   { vulnCtx.push('- Severity: '          + asString(indicator.severity)); }
+    if (indicator.advisory)   { vulnCtx.push('- Advisory: '          + asString(indicator.advisory)); }
+    if (indicator.threatFeed) { vulnCtx.push('- Threat Intel Feed: ' + asString(indicator.threatFeed)); }
+    if (indicator.confidence) { vulnCtx.push('- Confidence: '        + asString(indicator.confidence)); }
+    if (indicator.tlp)        { vulnCtx.push('- TLP: '               + asString(indicator.tlp)); }
+    if (vulnCtx.length) {
+        lines.push('');
+        lines.push('## Vulnerability & Threat Intel');
+        for (let vi = 0; vi < vulnCtx.length; vi++) { lines.push(vulnCtx[vi]); }
+    }
+
+    lines.push('');
+    lines.push('## Correlation Signals');
+    lines.push('- Defender Telemetry Silence (ms): ' + asString(silentMs));
+    lines.push('- Defender Silence Threshold (ms): ' + asString(SILENCE_MS));
+    lines.push('- Beacon Sample Count: ' + asString(beacon.count));
+    lines.push('- Beacon Mean Interval (ms): ' + asString(Math.round(beacon.meanMs)));
+    lines.push('- Beacon Interval CV: ' + asString(Math.round(beacon.cv * 1000) / 1000));
+    lines.push('');
+    lines.push('## Observation');
+    lines.push('- Observed At: ' + asString(new Date().toISOString()));
+    lines.push('- Traffic Direction: ' + asString(direction));
+    if (contextLine) { lines.push('- Context: ' + asString(contextLine)); }
+
+    return lines.join('\n');
+}
+
+/* =========================== Event Dispatch =========================== */
+
+const evtName = String(event);
+
+if (evtName === 'DNS_REQUEST') {
+    if (typeof DNS !== 'undefined' && DNS.qname) {
+        const qname = String(DNS.qname).toLowerCase();
+        if (qname === SINKHOLE_QNAME) { return; }
+        if (matchesDefenderDomain(qname)) {
+            markDefenderContact(qname, 'DNS_REQUEST');
+        }
+    }
+    return;
+}
+
+if (evtName === 'DNS_RESPONSE') {
+    if (typeof DNS !== 'undefined' && DNS.answers) {
+        try {
+            const ans = DNS.answers;
+            for (let ai = 0; ai < ans.length; ai++) {
+                const rdata = (ans[ai] && ans[ai].data) ? String(ans[ai].data) : '';
+                if (rdata && rdata.indexOf(SINKHOLE_IP) !== -1) { return; }
+            }
+        } catch (e) { /* fall through */ }
+    }
+    return;
+}
+
+if (evtName === 'HTTP_REQUEST') {
+    if (typeof HTTP !== 'undefined' && HTTP.host) {
+        const hhost = String(HTTP.host).toLowerCase();
+        if (matchesDefenderDomain(hhost)) {
+            markDefenderContact(hhost, 'HTTP_REQUEST');
+        }
+    }
+    return;
+}
+
+if (evtName === 'SSL_OPEN') {
+    if (typeof SSL !== 'undefined' && SSL.host) {
+        const sni = String(SSL.host).toLowerCase();
+        if (matchesDefenderDomain(sni)) {
+            markDefenderContact(sni, 'SSL_OPEN');
+        }
+    }
+    return;
+}
+
+if (evtName === 'FLOW_RECORD') {
+    const fClient = Flow.client;
+    const fServer = Flow.server;
+
+    const cLoc = clientLocality();
+    const sLoc = serverLocality();
+    if (cLoc !== 'internal' || sLoc !== 'external') { return; }
+
+    const devKey = clientDeviceKey();
+    const dstKey = serverIpKey();
+    if (!devKey || !dstKey) { return; }
+
+    if (dstKey === SINKHOLE_IP) { return; }
+
+    const clientBytes = (fClient ? Number(fClient.bytes || 0) : 0);
+    const serverBytes = (fServer ? Number(fServer.bytes || 0) : 0);
+    const flowBytes = clientBytes + serverBytes;
+    if (flowBytes > MAX_BYTES) { return; }
+
+    const now = getTimestamp();
+
+    const fsKey = K_FIRSTSEEN + devKey + '|' + dstKey;
+    const firstSeen = sessGet(fsKey);
+    let firstSeenMs = 0;
+    if (firstSeen === null || typeof firstSeen === 'undefined' || firstSeen === '') {
+        sessPut(fsKey, String(now), FIRSTSEEN_TTL_S);
+        firstSeenMs = now;
+    } else {
+        firstSeenMs = parseInt(String(firstSeen), 10);
+        if (isNaN(firstSeenMs)) { firstSeenMs = now; }
+    }
+
+    const bcKey = K_BEACON + devKey + '|' + dstKey;
+    let series = parseSeries(sessGet(bcKey));
+    series.push(now);
+    if (series.length > MAX_SAMPLES) {
+        const trimmed = [];
+        for (let ti = series.length - MAX_SAMPLES; ti < series.length; ti++) {
+            trimmed.push(series[ti]);
+        }
+        series = trimmed;
+    }
+    sessPut(bcKey, serializeSeries(series), BEACON_TTL_S);
+
+    const beacon = evalBeacon(series);
+    if (!beacon.fits) { return; }
+
+    const everSeen = sessGet(K_DEF_EVER + devKey);
+    if (!everSeen) {
+        dbg('No Defender baseline for device=' + devKey + '; skipping');
+        return;
+    }
+    const lastDefStr = sessGet(K_DEF_SEEN + devKey);
+    if (!lastDefStr) {
+        dbg('No last-Defender-contact entry (expired) for device=' + devKey + '; skipping');
+        return;
+    }
+    const lastDefMs = parseInt(String(lastDefStr), 10);
+    if (isNaN(lastDefMs)) { return; }
+    const silentMs = now - lastDefMs;
+    if (silentMs < SILENCE_MS) { return; }
+
+    const direction = classifyDirection('server', false);
+    const indicator = {
+        type:     'behavior',
+        value:    'defender_silent + beacon to ' + dstKey,
+        reason:   'Internal device has not contacted Defender telemetry endpoints in ' +
+                  Math.round(silentMs / 60000) + ' min and is exhibiting low-jitter beacon ' +
+                  'behavior to a new external destination.',
+        campaign: 'Defender-Blinded Host with New C2 / Beaconing',
+        name:     'Defender-Blinded Beacon',
+        category: 'C2',
+        source:   'ExtraHop Trigger (custom)',
+        ruleId:   'defender_blinded_c2_beacon',
+        pattern:  'count>=' + MIN_COUNT + ', mean in [' + MIN_PERIOD_MS + ',' + MAX_PERIOD_MS +
+                  '] ms, cv<' + CV_MAX + ', bytes<=' + MAX_BYTES,
+        severity: 'High',
+        confidence: 'Medium'
+    };
+    const contextLine = 'First-seen dest at ' + new Date(firstSeenMs).toISOString();
+    const desc = detectionDescription(indicator, contextLine, direction, beacon, silentMs);
+
+    const identityKey = devKey + '|' + dstKey + '|' + dayStamp(now);
+    const title = 'Defender-Blinded Host Beaconing to ' + dstKey;
+
+    const victimObj   = (fClient && fClient.device) ? fClient.device :
+                        (fClient ? fClient.ipaddr : null);
+    const offenderObj = (fServer && fServer.device) ? fServer.device :
+                        (fServer ? fServer.ipaddr : null);
+
+    let emitted = false;
+    if (typeof commitDetection === 'function' && victimObj && offenderObj) {
+        try {
+            commitDetection('defender_blinded_c2_beacon', {
+                title: title,
+                description: desc,
+                riskScore: RISK_SCORE,
+                participants: [
+                    { object: victimObj,   role: 'victim'   },
+                    { object: offenderObj, role: 'offender' }
+                ],
+                identityKey: identityKey,
+                identityTtl: 'day'
+            });
+            emitted = true;
+            dbg('commitDetection emitted for ' + identityKey);
+        } catch (e) {
+            dbg('commitDetection failed: ' + e);
+        }
+    } else if (typeof commitDetection !== 'function') {
+        dbg('commitDetection not available on this sensor; falling back to commitRecord');
+    } else {
+        dbg('Missing victim/offender object; falling back to commitRecord');
+    }
+
+    if (!emitted) {
+        try {
+            if (typeof commitRecord === 'function') {
+                commitRecord('defender_blinded_c2_match', {
+                    title: title,
+                    description: desc,
+                    clientIp: fClient ? fClient.ipaddr : null,
+                    serverIp: fServer ? fServer.ipaddr : null,
+                    deviceId: devKey,
+                    silentMs: silentMs,
+                    beaconCount: beacon.count,
+                    beaconMeanMs: Math.round(beacon.meanMs),
+                    beaconCv: Math.round(beacon.cv * 1000) / 1000,
+                    flowBytes: flowBytes,
+                    direction: direction,
+                    identityKey: identityKey
+                });
+            }
+        } catch (e2) {
+            dbg('commitRecord fallback failed: ' + e2);
+        }
+    }
+
+    if (fClient && fClient.device) {
+        if (typeof fClient.device.metricAddCount === 'function') {
+            try {
+                fClient.device.metricAddCount('defender_blinded_c2_beacon_matches', 1);
+            } catch (e3) { /* ignore */ }
+        }
+    }
+
+    sessPut(bcKey, '', BEACON_TTL_S);
+    return;
+}
